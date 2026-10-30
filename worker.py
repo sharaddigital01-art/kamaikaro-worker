@@ -1,30 +1,48 @@
 """
-24x7 multi-user Telegram deal-reposting worker.
+24x7 Multi-User Telegram Deal-Reposting Worker & Automation Service.
 
-Components (all in one asyncio loop):
-  1. aiogram 3 bot  - /start AUTH_{userId} linking, /status, /help
-  2. config sync    - polls the web API every N seconds, caches user setups
-  3. Telethon       - listens to source channels, converts links, reposts
+Features:
+  1. Aiogram 3 Bot with FSM Login (Phone -> OTP -> 2FA -> StringSession save).
+  2. Dynamic Channel Selection UI (Paginated inline keyboard for Source & Target channels).
+  3. Multi-Session Forwarding & Tracking Engine (Per-user Cuelinks sub_id conversion).
+  4. aiohttp Health-Check Server on PORT (for Render / cloud deployments).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.errors import (
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
+)
 from telethon.sessions import StringSession
 
 load_dotenv()
@@ -32,17 +50,17 @@ load_dotenv()
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
-API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-SESSION_STRING = os.getenv("TELETHON_SESSION_STRING", "")
+API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+SESSION_STRING = os.getenv("TELETHON_SESSION_STRING", "").strip()
 BASE_WEB_URL = os.getenv("BASE_WEB_URL", "https://kamai-three.vercel.app").rstrip("/")
-WORKER_API_SECRET = os.getenv("WORKER_API_SECRET", "")
-CUELINKS_PUB_ID = os.getenv("CUELINKS_PUB_ID", "282274")
-CUELINKS_CHNL_ID = os.getenv("CUELINKS_CHNL_ID", "332862")
+WORKER_API_SECRET = os.getenv("WORKER_API_SECRET", "kamaikaro-tg-worker-secret-2026").strip()
+CUELINKS_PUB_ID = os.getenv("CUELINKS_PUB_ID", "282274").strip()
+CUELINKS_CHNL_ID = os.getenv("CUELINKS_CHNL_ID", "332862").strip()
 SYNC_INTERVAL = int(os.getenv("CONFIG_SYNC_INTERVAL", "60"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", "8080"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -52,12 +70,14 @@ log = logging.getLogger("worker")
 
 VERIFY_URL = f"{BASE_WEB_URL}/api/telegram/verify-sync"
 CONFIG_URL = f"{BASE_WEB_URL}/api/telegram/user-config"
+SAVE_SESSION_URL = f"{BASE_WEB_URL}/api/telegram/save-session"
+CHANNELS_URL = f"{BASE_WEB_URL}/api/telegram/channels"
 
 SHORTENER_DOMAINS = (
     "amzn.to", "amzn.in", "a.co",
     "fkrt.it", "fkrt.cc", "dl.flipkart.com",
     "myntr.it", "ajio.page.link", "ajiio.in",
-    "bit.ly", "tinyurl.com", "cutt.ly", "t.co", "rb.gy", "shorturl.at"
+    "bit.ly", "tinyurl.com", "cutt.ly", "t.co", "rb.gy", "shorturl.at",
 )
 
 SUPPORTED_DOMAINS = {
@@ -71,20 +91,33 @@ ALL_DOMAINS = tuple(d for ds in SUPPORTED_DOMAINS.values() for d in ds)
 URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 TRAILING_PUNCT = ".,;:!?)]}>'\""
 
-CAPTION_LIMIT = 1024   # Telegram caption limit
+CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
+
+# Deduplication cache for incoming messages (chat_id, msg_id) -> timestamp
+_seen_posts: dict[tuple[int | str, int], float] = {}
+
+# In-memory tracking for pending logins: tg_user_id -> dict
+_pending_logins: dict[int, dict[str, Any]] = {}
+
+# In-memory drafts for channel selection: tg_user_id -> dict
+_channel_drafts: dict[int, dict[str, set[str]]] = {}
+_dialogs_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
 
 
 # --------------------------------------------------------------------------- #
-# Shared state: cached user configs
+# Shared State: Cached User Configs
 # --------------------------------------------------------------------------- #
 @dataclass
 class UserConfig:
     user_id: str
     telegram_user_id: str = ""
+    session_string: str = ""
     target_channel_id: Optional[int | str] = None
     target_channel_name: str = ""
+    target_channels: list[Any] = field(default_factory=list)
     source_channels: list[str] = field(default_factory=list)
+    source_channels_raw: list[Any] = field(default_factory=list)
     tracking_sub_id: str = ""
     is_active: bool = True
 
@@ -101,11 +134,19 @@ class ConfigStore:
     def active_for_source(self, source_keys: set[str]) -> list[UserConfig]:
         out = []
         for u in self.users.values():
-            if not (u.is_active and u.target_channel_id and u.tracking_sub_id):
+            if not (u.is_active and (u.target_channel_id or u.target_channels) and u.tracking_sub_id):
                 continue
-            if {norm_channel(c) for c in u.source_channels} & source_keys:
+            user_sources = {norm_channel(c) for c in u.source_channels}
+            if user_sources & source_keys:
                 out.append(u)
         return out
+
+    def get_by_telegram_id(self, tg_id: int | str) -> Optional[UserConfig]:
+        s_id = str(tg_id).strip()
+        for u in self.users.values():
+            if str(u.telegram_user_id).strip() == s_id:
+                return u
+        return None
 
     def all_sources(self) -> set[str]:
         s: set[str] = set()
@@ -119,15 +160,17 @@ class ConfigStore:
 store = ConfigStore()
 
 
-def norm_channel(c) -> str:
-    """Normalise a channel reference to a lowercase username or numeric id string."""
+def norm_channel(c: Any) -> str:
+    """Normalise a channel reference (str, int, dict) to a lowercase key."""
+    if isinstance(c, dict):
+        c = c.get("username") or c.get("id") or ""
     c = str(c or "").strip()
     c = re.sub(r"^https?://t\.me/", "", c, flags=re.I)
     c = c.lstrip("@").split("/")[0].split("?")[0]
     return c.lower()
 
 
-def parse_target(v):
+def parse_target(v: Any) -> Optional[int | str]:
     if v is None or v == "":
         return None
     s = str(v).strip()
@@ -137,7 +180,7 @@ def parse_target(v):
 
 
 # --------------------------------------------------------------------------- #
-# HTTP helpers
+# HTTP API Helpers
 # --------------------------------------------------------------------------- #
 _session: Optional[aiohttp.ClientSession] = None
 
@@ -145,9 +188,10 @@ _session: Optional[aiohttp.ClientSession] = None
 async def http() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
-        headers = {"User-Agent": "kamai-telegram-worker/1.0"}
-        if WORKER_API_SECRET:
-            headers["x-worker-secret"] = WORKER_API_SECRET
+        headers = {
+            "User-Agent": "kamai-telegram-worker/2.0",
+            "x-worker-secret": WORKER_API_SECRET,
+        }
         _session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT), headers=headers
         )
@@ -155,46 +199,140 @@ async def http() -> aiohttp.ClientSession:
 
 
 async def api_verify_sync(user_id: str, telegram_user_id: int | str, telegram_username: Optional[str]) -> dict:
-    """POST /api/telegram/verify-sync -> {"success": true, "trackingSubId": "..."}"""
+    """POST /api/telegram/verify-sync"""
     s = await http()
     payload = {
         "userId": user_id,
+        "authPayload": f"AUTH_{user_id}",
         "telegramUserId": str(telegram_user_id),
         "telegramUsername": telegram_username or "",
     }
-    async with s.post(VERIFY_URL, json=payload) as r:
-        try:
-            data = await r.json(content_type=None)
-        except Exception:
-            data = {"error": await r.text()}
-        if not isinstance(data, dict):
-            data = {"error": str(data)}
-        data["_status"] = r.status
-        return data
+    try:
+        async with s.post(VERIFY_URL, json=payload) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
+                data = {"message": await r.text()}
+            if not isinstance(data, dict):
+                data = {"message": str(data)}
+            data["_status"] = r.status
+            return data
+    except Exception as e:
+        log.warning("api_verify_sync error: %s", e)
+        return {"error": str(e), "_status": 500}
 
 
-async def api_fetch_configs(telegram_id: Optional[int | str] = None) -> list[dict]:
-    """GET /api/telegram/user-config?activeOnly=true | ?telegramId=<id> -> {"configs": [...]}"""
+async def api_fetch_configs(telegram_id: Optional[int | str] = None, user_id: Optional[str] = None) -> list[dict]:
+    """GET /api/telegram/user-config"""
     s = await http()
-    params = {"telegramId": str(telegram_id)} if telegram_id is not None else {"activeOnly": "true"}
-    async with s.get(CONFIG_URL, params=params) as r:
-        r.raise_for_status()
-        data = await r.json(content_type=None)
-    configs = data.get("configs") if isinstance(data, dict) else None
-    return configs if isinstance(configs, list) else []
+    params: dict[str, str] = {}
+    if telegram_id is not None:
+        params["telegramId"] = str(telegram_id)
+    elif user_id is not None:
+        params["userId"] = str(user_id)
+    else:
+        params["activeOnly"] = "true"
+
+    try:
+        async with s.get(CONFIG_URL, params=params) as r:
+            r.raise_for_status()
+            data = await r.json(content_type=None)
+            configs = data.get("configs") if isinstance(data, dict) else None
+            return configs if isinstance(configs, list) else []
+    except Exception as e:
+        log.warning("api_fetch_configs error: %s", e)
+        return []
+
+
+async def api_save_session(session_string: str, telegram_user_id: int | str, telegram_username: Optional[str], user_id: Optional[str] = None) -> dict:
+    """POST /api/telegram/save-session"""
+    s = await http()
+    payload = {
+        "sessionString": session_string,
+        "telegramUserId": str(telegram_user_id),
+        "telegramUsername": telegram_username or "",
+        "isActive": True,
+    }
+    if user_id:
+        payload["userId"] = user_id
+
+    try:
+        async with s.post(SAVE_SESSION_URL, json=payload) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
+                data = {"message": await r.text()}
+            if not isinstance(data, dict):
+                data = {"message": str(data)}
+            data["_status"] = r.status
+            return data
+    except Exception as e:
+        log.warning("api_save_session error: %s", e)
+        return {"error": str(e), "_status": 500}
+
+
+async def api_save_channels(telegram_user_id: int | str, source_channels: list[dict], target_channels: list[dict], target_channel_id: Optional[str], target_channel_name: Optional[str]) -> dict:
+    """POST /api/telegram/channels"""
+    s = await http()
+    payload = {
+        "telegramUserId": str(telegram_user_id),
+        "sourceChannels": source_channels,
+        "targetChannels": target_channels,
+        "targetChannelId": target_channel_id,
+        "targetChannelName": target_channel_name,
+        "isActive": True,
+    }
+    try:
+        async with s.post(CHANNELS_URL, json=payload) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
+                data = {"message": await r.text()}
+            if not isinstance(data, dict):
+                data = {"message": str(data)}
+            data["_status"] = r.status
+            return data
+    except Exception as e:
+        log.warning("api_save_channels error: %s", e)
+        return {"error": str(e), "_status": 500}
 
 
 def parse_config(raw: dict) -> Optional[UserConfig]:
     try:
-        sources = raw.get("sourceChannels") or []
-        if isinstance(sources, str):  # defensive: tolerate a comma-separated string
-            sources = [x for x in re.split(r"[,\s]+", sources) if x]
+        raw_sources = raw.get("sourceChannels") or []
+        if isinstance(raw_sources, str):
+            raw_sources = [x for x in re.split(r"[,\s]+", raw_sources) if x]
+
+        source_names: list[str] = []
+        for x in raw_sources:
+            if isinstance(x, dict):
+                u = x.get("username") or x.get("id") or ""
+                if u:
+                    source_names.append(str(u))
+            elif x:
+                source_names.append(str(x))
+
+        target_ch_list = raw.get("targetChannels") or []
+        primary_target = parse_target(raw.get("targetChannelId"))
+        primary_target_name = str(raw.get("targetChannelName") or "")
+
+        if not primary_target and target_ch_list and isinstance(target_ch_list, list):
+            first = target_ch_list[0]
+            if isinstance(first, dict):
+                primary_target = parse_target(first.get("id"))
+                primary_target_name = first.get("title") or ""
+            else:
+                primary_target = parse_target(first)
+
         return UserConfig(
             user_id=str(raw["userId"]),
             telegram_user_id=str(raw.get("telegramUserId") or ""),
-            target_channel_id=parse_target(raw.get("targetChannelId")),
-            target_channel_name=str(raw.get("targetChannelName") or ""),
-            source_channels=list(sources),
+            session_string=str(raw.get("sessionString") or ""),
+            target_channel_id=primary_target,
+            target_channel_name=primary_target_name,
+            target_channels=list(target_ch_list) if isinstance(target_ch_list, list) else [],
+            source_channels=source_names,
+            source_channels_raw=list(raw_sources) if isinstance(raw_sources, list) else [],
             tracking_sub_id=str(raw.get("trackingSubId") or ""),
             is_active=bool(raw.get("isActive", True)),
         )
@@ -204,7 +342,7 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
 
 
 # --------------------------------------------------------------------------- #
-# Link extraction + Cuelinks conversion
+# Link Extraction + Cuelinks Conversion Engine
 # --------------------------------------------------------------------------- #
 def _host_matches(host: str) -> bool:
     host = host.lower().split(":")[0]
@@ -242,14 +380,14 @@ def extract_deal_urls(text: str) -> list[str]:
 
 
 def strip_affiliate_params(url: str) -> str:
-    """Drop other people's tracking params so only the user's subid earns."""
+    """Drop third-party tracking params so only the user's subid earns."""
     try:
         p = urlparse(url)
         drop = {
             "tag", "affid", "aff_id", "affextparam1", "affextparam2",
             "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
             "subid", "cid", "ref", "ref_", "linkcode", "linkid", "ascsubtag",
-            "creative", "camp", "creativeasin"
+            "creative", "camp", "creativeasin",
         }
         q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
              if k.lower() not in drop and not k.lower().startswith("utm_")]
@@ -262,7 +400,6 @@ _RESOLVED_CACHE: dict[str, str] = {}
 
 
 async def unshorten_url(url: str) -> str:
-    """Follow redirects for shortened URLs (amzn.to, fkrt.it, bit.ly, etc.) to get destination product URL."""
     if url in _RESOLVED_CACHE:
         return _RESOLVED_CACHE[url]
     if not is_shortened_url(url):
@@ -292,10 +429,6 @@ async def unshorten_url(url: str) -> str:
 
 
 def to_cuelinks(url: str, sub_id: str) -> str:
-    """
-    Form the redirect URL correctly:
-        https://linksredirect.com/?pub_id={CUELINKS_PUB_ID}&chnl_id={CUELINKS_CHNL_ID}&subid={sub_id}&url={encoded_target_url}
-    """
     clean = strip_affiliate_params(url)
     encoded_target_url = quote(clean, safe="")
     return f"https://linksredirect.com/?pub_id={CUELINKS_PUB_ID}&chnl_id={CUELINKS_CHNL_ID}&subid={sub_id}&url={encoded_target_url}"
@@ -315,168 +448,124 @@ async def convert_text(text: str, sub_id: str) -> tuple[str, int]:
 
 
 # --------------------------------------------------------------------------- #
-# aiogram bot
+# Multi-Session Telethon Manager
 # --------------------------------------------------------------------------- #
-router = Router()
+class MultiSessionManager:
+    def __init__(self) -> None:
+        self.clients: dict[str, TelegramClient] = {}  # session_string -> TelegramClient
+        self.user_sessions: dict[str, str] = {}       # telegram_user_id -> session_string
+        self.bot_instance: Optional[Bot] = None
+        self._lock = asyncio.Lock()
 
-HELP_TEXT = (
-    "<b>Kamai Karo Bot</b>\n\n"
-    "/start - link your account (use the button on the website)\n"
-    "/status - check your connection &amp; config\n"
-    "/help - show this message\n\n"
-    "Once linked, deals from your chosen source channels are converted to your "
-    "affiliate links and posted to your target channel automatically. "
-    "Make sure this bot is an <b>admin</b> in your target channel."
-)
+    def set_bot(self, bot: Bot) -> None:
+        self.bot_instance = bot
 
-
-@router.message(Command("start"))
-async def cmd_start(message: Message, command: CommandObject) -> None:
-    arg = (command.args or "").strip()
-    if not arg.startswith("AUTH_"):
-        await message.answer(
-            "👋 Welcome! To connect your account, open the website dashboard and "
-            f"tap <b>Connect Telegram</b>.\n\n{HELP_TEXT}"
-        )
-        return
-
-    user_id = arg[len("AUTH_"):]
-    if not re.fullmatch(r"[A-Za-z0-9_\-]{1,128}", user_id):
-        await message.answer("❌ Invalid link. Please generate a new one from the website.")
-        return
-
-    tg_user = message.from_user
-    if tg_user is None:
-        await message.answer("❌ Couldn't identify your Telegram account.")
-        return
-
-    payload = {
-        "userId": user_id,
-        "authPayload": arg,
-        "telegramUserId": str(tg_user.id),
-        "telegramUsername": tg_user.username or "",
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{BASE_WEB_URL}/api/telegram/verify-sync", json=payload) as resp:
-                http_status = resp.status
+    async def get_or_create_client(self, session_str: str, name: str = "client") -> Optional[TelegramClient]:
+        if not session_str:
+            return None
+        async with self._lock:
+            if session_str in self.clients:
+                client = self.clients[session_str]
+                if client.is_connected():
+                    return client
                 try:
-                    data = await resp.json()
+                    await client.connect()
+                    return client
                 except Exception:
-                    data = {"message": await resp.text()}
+                    pass
 
-                is_success = (
-                    http_status == 200 or 
-                    data.get("success") is True or 
-                    "successfully" in str(data.get("message", "")).lower()
-                )
+            try:
+                client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+                await client.connect()
+                if not await client.is_user_authorized():
+                    log.warning("Session string for %s is not authorized/expired.", name)
+                    await client.disconnect()
+                    return None
 
-                if is_success:
-                    sub_id = data.get("trackingSubId") or (data.get("user") or {}).get("trackingSubId", "tg_deal")
-                    await message.answer(
-                        f"✅ <b>Account Connected Successfully!</b>\n\n"
-                        f"🔗 <b>Your tracking SubID:</b> <code>{sub_id}</code>\n\n"
-                        f"👉 <b>Next step:</b> Apne channel me bot ko Admin banayein aur dashboard me Target Channel save karein.",
-                        parse_mode="HTML"
-                    )
-                    asyncio.create_task(refresh_configs())
-                else:
-                    err = data.get("error") or data.get("message") or f"HTTP {http_status}"
-                    await message.answer(f"❌ Linking failed: {err}")
-    except Exception:
-        log.exception("verify-sync failed")
-        await message.answer("⚠️ Couldn't reach the server. Please try again in a minute.")
+                @client.on(events.NewMessage(incoming=True))
+                async def _on_msg(event: Any) -> None:
+                    if not (event.is_channel or event.is_group):
+                        return
+                    if self.bot_instance:
+                        try:
+                            await handle_new_post(event, self.bot_instance)
+                        except Exception:
+                            log.exception("Error in handle_new_post")
 
+                self.clients[session_str] = client
+                log.info("Telethon client [%s] connected & listening.", name)
+                return client
+            except Exception as e:
+                log.warning("Failed to initialize Telethon client for %s: %s", name, e)
+                return None
 
-@router.message(Command("status"))
-async def cmd_status(message: Message) -> None:
-    if message.from_user is None:
-        return
-    try:
-        rows = await api_fetch_configs(telegram_id=message.from_user.id)
-    except Exception:
-        log.exception("status fetch failed")
-        await message.answer("⚠️ Couldn't fetch your status right now.")
-        return
+    async def sync_user_sessions(self, users: dict[str, UserConfig]) -> None:
+        # Also ensure the default worker SESSION_STRING is active if provided
+        if SESSION_STRING and SESSION_STRING not in self.clients:
+            await self.get_or_create_client(SESSION_STRING, "global-default")
 
-    mine = [c for c in (parse_config(r) for r in rows) if c]
-    if not mine:
-        await message.answer("ℹ️ No linked account found. Use the Connect Telegram button on the website.")
-        return
+        for u in users.values():
+            if u.is_active and u.session_string:
+                self.user_sessions[str(u.telegram_user_id)] = u.session_string
+                await self.get_or_create_client(u.session_string, f"user-{u.telegram_user_id}")
 
-    c = mine[0]
-    target = c.target_channel_name or c.target_channel_id or "not set"
-    await message.answer(
-        "📊 <b>Your status</b>\n\n"
-        f"Active: {'🟢 Yes' if c.is_active else '🔴 No'}\n"
-        f"SubID: <code>{c.tracking_sub_id or 'N/A'}</code>\n"
-        f"Target channel: <code>{target}</code>\n"
-        f"Source channels: {len(c.source_channels)}\n"
-        + "\n".join(f"• {x}" for x in c.source_channels[:15])
-    )
+    async def register_user_client(self, telegram_user_id: str, client: TelegramClient) -> None:
+        session_str = client.session.save()
+        async with self._lock:
+            self.clients[session_str] = client
+            self.user_sessions[str(telegram_user_id)] = session_str
 
+        @client.on(events.NewMessage(incoming=True))
+        async def _on_msg(event: Any) -> None:
+            if not (event.is_channel or event.is_group):
+                return
+            if self.bot_instance:
+                try:
+                    await handle_new_post(event, self.bot_instance)
+                except Exception:
+                    log.exception("Error in user handle_new_post")
 
-@router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    async def get_client_for_telegram_id(self, telegram_user_id: int | str) -> Optional[TelegramClient]:
+        s_id = str(telegram_user_id).strip()
+        sess = self.user_sessions.get(s_id)
+        if sess and sess in self.clients:
+            c = self.clients[sess]
+            if not c.is_connected():
+                await c.connect()
+            return c
 
+        u = store.get_by_telegram_id(s_id)
+        if u and u.session_string:
+            return await self.get_or_create_client(u.session_string, f"user-{s_id}")
 
-# --------------------------------------------------------------------------- #
-# Config sync worker
-# --------------------------------------------------------------------------- #
-tele: Optional[TelegramClient] = None
-_watched: set[str] = set()
+        if SESSION_STRING:
+            return await self.get_or_create_client(SESSION_STRING, "global-default")
+        return None
 
-
-async def refresh_configs() -> None:
-    try:
-        rows = await api_fetch_configs()
-    except Exception as e:
-        log.warning("Config sync failed (keeping previous cache): %s", e)
-        return
-    users: dict[str, UserConfig] = {}
-    for r in rows:
-        cfg = parse_config(r)
-        if cfg:
-            users[cfg.user_id] = cfg
-    store.replace(users)
-    log.info("Config synced: %d users, %d active sources", len(users), len(store.all_sources()))
-    await resolve_sources()
-
-
-async def config_sync_loop() -> None:
-    while True:
-        await refresh_configs()
-        await asyncio.sleep(SYNC_INTERVAL)
+    async def disconnect_all(self) -> None:
+        async with self._lock:
+            for s, c in list(self.clients.items()):
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
+            self.clients.clear()
 
 
-async def resolve_sources() -> None:
-    """Warm up Telethon's entity cache for new source channels so events fire."""
-    global _watched
-    if tele is None:
-        return
-    for key in store.all_sources() - _watched:
-        try:
-            await tele.get_input_entity(int(key) if re.fullmatch(r"-?\d+", key) else key)
-            _watched.add(key)
-            log.info("Watching source: %s", key)
-        except Exception as e:
-            log.warning("Cannot resolve source %s (is the session account joined?): %s", key, e)
-        await asyncio.sleep(1.5)  # be gentle with Telegram rate limits
+session_mgr = MultiSessionManager()
 
 
 # --------------------------------------------------------------------------- #
-# Telethon scraper & deal processor
+# Telethon Deal Dispatcher & Poster
 # --------------------------------------------------------------------------- #
-def chat_keys(chat) -> set[str]:
+def chat_keys(chat: Any) -> set[str]:
     keys = set()
     uname = getattr(chat, "username", None)
     if uname:
         keys.add(uname.lower())
     cid = getattr(chat, "id", None)
     if cid is not None:
-        keys.update({str(cid), f"-100{cid}"})
+        keys.update({str(cid), f"-100{cid}", str(abs(cid))})
     return keys
 
 
@@ -484,35 +573,81 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, media_path: Option
     converted, n = await convert_text(text, user.tracking_sub_id)
     if n == 0:
         return
-    target = user.target_channel_id
-    if media_path:
-        caption = converted[:CAPTION_LIMIT]
-        from aiogram.types import FSInputFile
-        await bot.send_photo(target, FSInputFile(media_path), caption=caption, parse_mode=None)
-        if len(converted) > CAPTION_LIMIT:
-            await bot.send_message(target, converted[CAPTION_LIMIT:CAPTION_LIMIT + MESSAGE_LIMIT],
-                                   parse_mode=None, disable_web_page_preview=True)
-    else:
-        await bot.send_message(target, converted[:MESSAGE_LIMIT], parse_mode=None)
+
+    targets = []
+    if user.target_channel_id:
+        targets.append(user.target_channel_id)
+    for t in user.target_channels:
+        t_id = parse_target(t.get("id") if isinstance(t, dict) else t)
+        if t_id and t_id not in targets:
+            targets.append(t_id)
+
+    if not targets:
+        return
+
+    for target in targets:
+        try:
+            if media_path:
+                caption = converted[:CAPTION_LIMIT]
+                await bot.send_photo(target, FSInputFile(media_path), caption=caption, parse_mode=None)
+                if len(converted) > CAPTION_LIMIT:
+                    await bot.send_message(target, converted[CAPTION_LIMIT:CAPTION_LIMIT + MESSAGE_LIMIT],
+                                           parse_mode=None, disable_web_page_preview=True)
+            else:
+                await bot.send_message(target, converted[:MESSAGE_LIMIT], parse_mode=None)
+        except Exception as bot_err:
+            log.warning("Bot posting to %s failed (%s); trying via user client session...", target, bot_err)
+            u_client = await session_mgr.get_client_for_telegram_id(user.telegram_user_id)
+            if u_client:
+                try:
+                    await u_client.send_message(target, converted, file=media_path)
+                    log.info("Posted via user client to %s", target)
+                except Exception as client_err:
+                    log.error("User client posting also failed to %s: %s", target, client_err)
 
 
-async def handle_new_post(event, bot: Bot) -> None:
+async def safe_post(bot: Bot, user: UserConfig, text: str, media_path: Optional[str]) -> bool:
+    try:
+        await post_to_user(bot, user, text, media_path)
+        return True
+    except Exception as e:
+        log.error("safe_post failed for user %s: %s", user.user_id, e)
+        return False
+
+
+async def handle_new_post(event: Any, bot: Bot) -> None:
     msg = event.message
+    if not msg:
+        return
+
+    # Deduplication
+    chat_id = getattr(event, "chat_id", None)
+    msg_id = getattr(msg, "id", None)
+    if chat_id is not None and msg_id is not None:
+        dedup_key = (chat_id, msg_id)
+        now = time.time()
+        if dedup_key in _seen_posts and (now - _seen_posts[dedup_key]) < 600:
+            return
+        _seen_posts[dedup_key] = now
+        if len(_seen_posts) > 10000:
+            for k in list(_seen_posts.keys())[:3000]:
+                _seen_posts.pop(k, None)
+
     text = msg.message or ""
-    # also pull URLs hidden behind text entities (hyperlinks)
     for ent in (msg.entities or []):
         url = getattr(ent, "url", None)
         if url:
             text += "\n" + url
+
     if not extract_deal_urls(text):
         return
 
     chat = await event.get_chat()
-    users = store.active_for_source(chat_keys(chat))
+    c_keys = chat_keys(chat)
+    users = store.active_for_source(c_keys)
     if not users:
         return
 
-    # Replace hyperlinked entities' visible text with their URLs so conversion catches them
     display_text = msg.message or ""
     for ent in sorted(msg.entities or [], key=lambda e: -e.offset):
         url = getattr(ent, "url", None)
@@ -521,7 +656,6 @@ async def handle_new_post(event, bot: Bot) -> None:
     if display_text.strip() == "":
         display_text = text
 
-    # Pre-resolve any shortened URLs in parallel so all users resolve instantly from cache
     deal_urls = extract_deal_urls(display_text)
     if not deal_urls:
         return
@@ -531,10 +665,10 @@ async def handle_new_post(event, bot: Bot) -> None:
 
     media_path = None
     try:
-        if msg.photo:
+        if getattr(msg, "photo", None):
             media_path = await msg.download_media(file="/tmp/")
     except Exception:
-        log.exception("Media download failed; posting text only")
+        log.exception("Media download failed; continuing with text only")
 
     try:
         results = await asyncio.gather(
@@ -551,62 +685,707 @@ async def handle_new_post(event, bot: Bot) -> None:
                 pass
 
 
-async def safe_post(bot: Bot, user: UserConfig, text: str, media_path: Optional[str]) -> bool:
-    """One user's failure must never affect others."""
-    try:
-        await post_to_user(bot, user, text, media_path)
-        return True
-    except Exception as e:
-        log.error("Post failed for user %s -> %s: %s", user.user_id, user.target_channel_id, e)
-        return False
-
-
 # --------------------------------------------------------------------------- #
-# Entrypoint
+# Aiogram FSM & Dialog Management
 # --------------------------------------------------------------------------- #
-def validate_env() -> None:
-    missing = [k for k, v in {
-        "BOT_TOKEN": BOT_TOKEN, "TELEGRAM_API_ID": API_ID,
-        "TELEGRAM_API_HASH": API_HASH, "TELETHON_SESSION_STRING": SESSION_STRING,
-    }.items() if not v]
-    if missing:
-        raise SystemExit(
-            "Missing env vars: " + ", ".join(missing) +
-            ("\nRun `python generate_session.py` to create TELETHON_SESSION_STRING." if "TELETHON_SESSION_STRING" in missing else "")
-        )
+class LoginFSM(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_otp = State()
+    waiting_for_2fa = State()
 
 
-async def run_telethon(bot: Bot) -> None:
-    global tele
-    while True:
+router = Router()
+
+HELP_TEXT = (
+    "<b>KamaiKaro Deal Automation Bot</b>\n\n"
+    "Commands:\n"
+    "• /start - Open main menu & dashboard\n"
+    "• /login - Connect your personal Telegram account\n"
+    "• /mychannels - Select Source & Target channels\n"
+    "• /status - View your automation status & SubID\n"
+    "• /cancel - Cancel any ongoing action\n\n"
+    "Deals from your chosen source channels are automatically converted with your "
+    "tracking SubID and posted straight to your channel!"
+)
+
+
+def get_main_menu_keyboard(is_logged_in: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="📱 Login Telegram Account" if not is_logged_in else "🔄 Re-login Telegram Account",
+                callback_data="menu:login",
+            )
+        ],
+        [
+            InlineKeyboardButton(text="📢 Select Channels", callback_data="menu:channels"),
+            InlineKeyboardButton(text="⚙️ Automation Status", callback_data="menu:status"),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, command: CommandObject) -> None:
+    tg_user = message.from_user
+    if tg_user is None:
+        await message.answer("❌ Couldn't identify your Telegram account.")
+        return
+
+    arg = (command.args or "").strip()
+    user_id = arg.replace("AUTH_", "").strip() if arg else ""
+
+    if user_id:
+        res = await api_verify_sync(user_id, tg_user.id, tg_user.username)
+        sub_id = res.get("trackingSubId") or (res.get("user") or {}).get("trackingSubId")
+        if res.get("_status") == 200 and (res.get("success") is True or "successfully" in str(res.get("message") or "").lower()):
+            asyncio.create_task(refresh_configs())
+            await message.answer(
+                f"✅ <b>Account Connected Successfully!</b>\n\n"
+                f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id or 'EK_tg'}</code>\n\n"
+                "👉 Connect your Telegram session below to let KamaiKaro read your channels:",
+                reply_markup=get_main_menu_keyboard(is_logged_in=False),
+                parse_mode="HTML",
+            )
+            return
+
+    # Check if this user is already linked
+    u_cfg = store.get_by_telegram_id(tg_user.id)
+    is_logged_in = bool(u_cfg and u_cfg.session_string)
+
+    await message.answer(
+        "👋 <b>Welcome to KamaiKaro Deal Automation Bot!</b>\n\n"
+        "Automatically convert e-commerce deals with your personal affiliate SubID "
+        "and broadcast them into your channel 24x7.\n\n"
+        "Select an option below to get started:",
+        reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "menu:main")
+async def cb_main_menu(query: CallbackQuery) -> None:
+    u_cfg = store.get_by_telegram_id(query.from_user.id)
+    is_logged_in = bool(u_cfg and u_cfg.session_string)
+    await query.message.edit_text(
+        "👋 <b>KamaiKaro Deal Automation Bot Menu</b>\n\n"
+        "Choose an action below:",
+        reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in),
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+
+@router.message(Command("cancel"))
+@router.callback_query(F.data == "login:cancel")
+async def cancel_handler(event: Message | CallbackQuery, state: FSMContext) -> None:
+    tg_user_id = event.from_user.id
+    pending = _pending_logins.pop(tg_user_id, None)
+    if pending:
         try:
-            tele = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-            await tele.connect()
-            if not await tele.is_user_authorized():
-                raise SystemExit("TELETHON_SESSION_STRING is invalid/expired. Regenerate it.")
-
-            @tele.on(events.NewMessage(incoming=True))
-            async def _on_msg(event):
-                if not (event.is_channel or event.is_group):
-                    return
-                try:
-                    await handle_new_post(event, bot)
-                except Exception:
-                    log.exception("Unhandled error processing post")
-
-            log.info("Telethon connected.")
-            await store.loaded.wait()
-            await resolve_sources()
-            await tele.run_until_disconnected()
-        except SystemExit:
-            raise
+            await pending["client"].disconnect()
         except Exception:
-            log.exception("Telethon crashed; restarting in 10s")
-        await asyncio.sleep(10)
+            pass
+    await state.clear()
+    msg = event.message if isinstance(event, CallbackQuery) else event
+    await msg.answer("❌ Action cancelled. Tap /start to open the main menu.")
+    if isinstance(event, CallbackQuery):
+        await event.answer()
 
 
+# --------------------------------------------------------------------------- #
+# Telegram Login Flow (FSM)
+# --------------------------------------------------------------------------- #
+@router.message(Command("login"))
+@router.callback_query(F.data == "menu:login")
+async def start_login(event: Message | CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    tg_user_id = event.from_user.id
+    pending = _pending_logins.pop(tg_user_id, None)
+    if pending:
+        try:
+            await pending["client"].disconnect()
+        except Exception:
+            pass
+
+    await state.set_state(LoginFSM.waiting_for_phone)
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
+
+    text = (
+        "📱 <b>Telegram Account Authentication</b>\n\n"
+        "Please enter your Telegram phone number with international country code:\n"
+        "Example: <code>+919876543210</code>\n\n"
+        "<i>Your session string will be created directly on this secure server.</i>"
+    )
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=cancel_kb, parse_mode="HTML")
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=cancel_kb, parse_mode="HTML")
+
+
+@router.message(LoginFSM.waiting_for_phone)
+async def process_phone(message: Message, state: FSMContext) -> None:
+    phone = (message.text or "").strip().replace(" ", "").replace("-", "")
+    if not re.match(r"^\+\d{7,16}$", phone):
+        await message.answer("❌ Invalid format. Please enter phone number starting with +, e.g. <code>+919876543210</code>:")
+        return
+
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await client.connect()
+    try:
+        req = await client.send_code_request(phone)
+    except Exception as e:
+        log.warning("send_code_request error for %s: %s", phone, e)
+        await client.disconnect()
+        await message.answer(f"❌ Failed to send code from Telegram: {e}\n\nPlease try again with /login.")
+        await state.clear()
+        return
+
+    tg_user_id = message.from_user.id
+    _pending_logins[tg_user_id] = {
+        "client": client,
+        "phone": phone,
+        "phone_code_hash": req.phone_code_hash,
+    }
+    await state.update_data(phone=phone, phone_code_hash=req.phone_code_hash)
+    await state.set_state(LoginFSM.waiting_for_otp)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
+    await message.answer(
+        f"📩 <b>OTP sent to {phone}!</b>\n\n"
+        "Telegram has sent a verification code to your Telegram app (or SMS).\n\n"
+        "👉 Enter the code here:\n"
+        "<i>(e.g. <code>12345</code> or <code>1 2 3 4 5</code>)</i>",
+        reply_markup=cancel_kb,
+        parse_mode="HTML",
+    )
+
+
+@router.message(LoginFSM.waiting_for_otp)
+async def process_otp(message: Message, state: FSMContext) -> None:
+    code = (message.text or "").strip().replace(" ", "").replace("-", "")
+    tg_user_id = message.from_user.id
+    pending = _pending_logins.get(tg_user_id)
+    if not pending:
+        await message.answer("⚠️ Session expired. Please start over with /login.")
+        await state.clear()
+        return
+
+    client: TelegramClient = pending["client"]
+    phone = pending["phone"]
+    phone_code_hash = pending["phone_code_hash"]
+
+    try:
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+    except SessionPasswordNeededError:
+        await state.set_state(LoginFSM.waiting_for_2fa)
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
+        await message.answer(
+            "🔐 <b>Two-Step Verification (2FA) is Enabled!</b>\n\n"
+            "Please enter your Telegram 2FA cloud password to complete login:",
+            reply_markup=cancel_kb,
+            parse_mode="HTML",
+        )
+        return
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError) as pe:
+        await message.answer(f"❌ Verification failed: {pe}. Please re-enter the code or /cancel:")
+        return
+    except Exception as e:
+        log.warning("sign_in error: %s", e)
+        await message.answer(f"❌ Login failed: {e}\n\nPlease try again or /cancel:")
+        return
+
+    await finish_login(message, state, client, tg_user_id)
+
+
+@router.message(LoginFSM.waiting_for_2fa)
+async def process_2fa(message: Message, state: FSMContext) -> None:
+    password = (message.text or "").strip()
+    tg_user_id = message.from_user.id
+    pending = _pending_logins.get(tg_user_id)
+    if not pending:
+        await message.answer("⚠️ Session expired. Please start over with /login.")
+        await state.clear()
+        return
+
+    client: TelegramClient = pending["client"]
+    try:
+        await client.sign_in(password=password)
+    except PasswordHashInvalidError:
+        await message.answer("❌ Incorrect 2FA password. Please re-enter your password or /cancel:")
+        return
+    except Exception as e:
+        log.warning("2FA sign_in error: %s", e)
+        await message.answer(f"❌ 2FA error: {e}\n\nPlease re-enter password or /cancel:")
+        return
+
+    await finish_login(message, state, client, tg_user_id)
+
+
+async def finish_login(message: Message, state: FSMContext, client: TelegramClient, tg_user_id: int) -> None:
+    session_str = client.session.save()
+    tg_user = message.from_user
+
+    # Save to Next.js API
+    res = await api_save_session(
+        session_string=session_str,
+        telegram_user_id=tg_user_id,
+        telegram_username=tg_user.username or "",
+    )
+
+    await state.clear()
+    _pending_logins.pop(tg_user_id, None)
+
+    # Register live client
+    await session_mgr.register_user_client(str(tg_user_id), client)
+    asyncio.create_task(refresh_configs())
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Select Channels", callback_data="menu:channels")],
+        [InlineKeyboardButton(text="⚙️ Automation Status", callback_data="menu:status")],
+    ])
+
+    await message.answer(
+        "✅ <b>Account Linked Successfully!</b>\n\n"
+        "Your Telegram account is now connected and authorized.\n\n"
+        "👉 Next step: tap <b>[📢 Select Channels]</b> to choose your source & target channels.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Dynamic Channel Selection UI (Pagination & Checkmarks)
+# --------------------------------------------------------------------------- #
+async def get_user_dialogs(tg_user_id: int) -> list[dict[str, Any]]:
+    now = time.time()
+    if tg_user_id in _dialogs_cache:
+        ts, cached = _dialogs_cache[tg_user_id]
+        if (now - ts) < 180:  # cache for 3 mins
+            return cached
+
+    client = await session_mgr.get_client_for_telegram_id(tg_user_id)
+    if not client:
+        return []
+
+    try:
+        dialogs = await client.get_dialogs(limit=100)
+    except Exception as e:
+        log.warning("get_dialogs failed for %s: %s", tg_user_id, e)
+        return []
+
+    out = []
+    for d in dialogs:
+        if d.is_channel or d.is_group:
+            entity = d.entity
+            admin_rights = getattr(entity, "admin_rights", None)
+            is_creator = getattr(entity, "creator", False)
+            can_post = bool(
+                is_creator
+                or (admin_rights and (getattr(admin_rights, "post_messages", False) or getattr(admin_rights, "send_messages", False)))
+                or getattr(entity, "megagroup", False)
+            )
+            out.append({
+                "id": d.id,
+                "title": d.title or "Untitled Channel",
+                "username": getattr(entity, "username", None),
+                "can_post": can_post,
+            })
+
+    _dialogs_cache[tg_user_id] = (now, out)
+    return out
+
+
+def build_channel_hub_kb(sources_count: int, targets_count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📥 Source Channels ({sources_count})", callback_data="ch:src:0")],
+        [InlineKeyboardButton(text=f"📤 Target Channel(s) ({targets_count})", callback_data="ch:tgt:0")],
+        [InlineKeyboardButton(text="💾 Save & Activate Channels", callback_data="ch:save")],
+        [InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="menu:main")],
+    ])
+
+
+@router.message(Command("mychannels"))
+@router.callback_query(F.data == "menu:channels")
+@router.callback_query(F.data == "ch:hub")
+async def show_channel_hub(event: Message | CallbackQuery) -> None:
+    tg_user_id = event.from_user.id
+    u_cfg = store.get_by_telegram_id(tg_user_id)
+
+    # Initialize draft selection if not present
+    if tg_user_id not in _channel_drafts:
+        initial_sources = set()
+        initial_targets = set()
+        if u_cfg:
+            for s in u_cfg.source_channels:
+                initial_sources.add(norm_channel(s))
+            if u_cfg.target_channel_id:
+                initial_targets.add(str(u_cfg.target_channel_id))
+            for t in u_cfg.target_channels:
+                t_id = str(t.get("id") if isinstance(t, dict) else t)
+                if t_id:
+                    initial_targets.add(t_id)
+        _channel_drafts[tg_user_id] = {
+            "sources": initial_sources,
+            "targets": initial_targets,
+        }
+
+    draft = _channel_drafts[tg_user_id]
+
+    text = (
+        "📢 <b>Channel Management Hub</b>\n\n"
+        f"📥 <b>Source Channels:</b> {len(draft['sources'])} selected (deals monitored)\n"
+        f"📤 <b>Target Channels:</b> {len(draft['targets'])} selected (deals posted with your SubID)\n\n"
+        "Tap below to customize your channels, then click <b>Save & Activate</b>:"
+    )
+
+    kb = build_channel_hub_kb(len(draft["sources"]), len(draft["targets"]))
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("ch:src:"))
+async def view_source_channels(query: CallbackQuery) -> None:
+    page = int(query.data.split(":")[2])
+    tg_user_id = query.from_user.id
+    dialogs = await get_user_dialogs(tg_user_id)
+
+    if not dialogs:
+        await query.answer("⚠️ Could not load channels. Please /login first.", show_alert=True)
+        return
+
+    draft = _channel_drafts.setdefault(tg_user_id, {"sources": set(), "targets": set()})
+    sources = draft["sources"]
+
+    page_size = 5
+    total_pages = max(1, math.ceil(len(dialogs) / page_size))
+    page = max(0, min(page, total_pages - 1))
+    items = dialogs[page * page_size : (page + 1) * page_size]
+
+    keyboard_rows = []
+    for d in items:
+        k1 = norm_channel(d.get("username") or "")
+        k2 = str(d["id"])
+        k3 = norm_channel(k2)
+        is_sel = bool(k1 and k1 in sources) or (k2 in sources) or (k3 in sources)
+        prefix = "✅ " if is_sel else "⬜ "
+        title = (d["title"] or "Channel")[:22]
+        keyboard_rows.append([
+            InlineKeyboardButton(text=f"{prefix}{title}", callback_data=f"ch:ts:{d['id']}:{page}")
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"ch:src:{page-1}"))
+    nav_row.append(InlineKeyboardButton(text=f"Page {page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"ch:src:{page+1}"))
+    keyboard_rows.append(nav_row)
+
+    keyboard_rows.append([
+        InlineKeyboardButton(text="🔙 Back to Channels Hub", callback_data="ch:hub")
+    ])
+
+    await query.message.edit_text(
+        "📥 <b>Select Source Channels</b> (Where deals are monitored from):\n\n"
+        "Tap a channel to toggle checkmark. When done, go back to the hub and tap Save.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("ch:ts:"))
+async def toggle_source_channel(query: CallbackQuery) -> None:
+    parts = query.data.split(":")
+    ch_id = parts[2]
+    page = int(parts[3])
+    tg_user_id = query.from_user.id
+    draft = _channel_drafts.setdefault(tg_user_id, {"sources": set(), "targets": set()})
+
+    # Find username if available
+    dialogs = await get_user_dialogs(tg_user_id)
+    key = norm_channel(ch_id)
+    for d in dialogs:
+        if str(d["id"]) == ch_id and d.get("username"):
+            key = norm_channel(d["username"])
+            break
+
+    if key in draft["sources"] or ch_id in draft["sources"]:
+        draft["sources"].discard(key)
+        draft["sources"].discard(ch_id)
+    else:
+        draft["sources"].add(key)
+
+    await view_source_channels(query)
+
+
+@router.callback_query(F.data.startswith("ch:tgt:"))
+async def view_target_channels(query: CallbackQuery) -> None:
+    page = int(query.data.split(":")[2])
+    tg_user_id = query.from_user.id
+    dialogs = await get_user_dialogs(tg_user_id)
+
+    if not dialogs:
+        await query.answer("⚠️ Could not load channels. Please /login first.", show_alert=True)
+        return
+
+    # Sort channels where user has posting permissions first
+    targets_pool = sorted(dialogs, key=lambda x: not x["can_post"])
+    draft = _channel_drafts.setdefault(tg_user_id, {"sources": set(), "targets": set()})
+    targets = draft["targets"]
+
+    page_size = 5
+    total_pages = max(1, math.ceil(len(targets_pool) / page_size))
+    page = max(0, min(page, total_pages - 1))
+    items = targets_pool[page * page_size : (page + 1) * page_size]
+
+    keyboard_rows = []
+    for d in items:
+        ch_id_str = str(d["id"])
+        is_sel = ch_id_str in targets or (d.get("username") and norm_channel(d["username"]) in targets)
+        prefix = "🎯 " if is_sel else "⬜ "
+        tag = " (Admin)" if d["can_post"] else ""
+        title = (d["title"] or "Channel")[:20] + tag
+        keyboard_rows.append([
+            InlineKeyboardButton(text=f"{prefix}{title}", callback_data=f"ch:tt:{d['id']}:{page}")
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"ch:tgt:{page-1}"))
+    nav_row.append(InlineKeyboardButton(text=f"Page {page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"ch:tgt:{page+1}"))
+    keyboard_rows.append(nav_row)
+
+    keyboard_rows.append([
+        InlineKeyboardButton(text="🔙 Back to Channels Hub", callback_data="ch:hub")
+    ])
+
+    await query.message.edit_text(
+        "📤 <b>Select Target Channels</b> (Where converted deals are posted):\n\n"
+        "Tap a channel to toggle target selection. When done, go back to the hub and tap Save.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("ch:tt:"))
+async def toggle_target_channel(query: CallbackQuery) -> None:
+    parts = query.data.split(":")
+    ch_id = parts[2]
+    page = int(parts[3])
+    tg_user_id = query.from_user.id
+    draft = _channel_drafts.setdefault(tg_user_id, {"sources": set(), "targets": set()})
+
+    ch_id_str = str(ch_id)
+    if ch_id_str in draft["targets"]:
+        draft["targets"].discard(ch_id_str)
+    else:
+        draft["targets"].add(ch_id_str)
+
+    await view_target_channels(query)
+
+
+@router.callback_query(F.data == "ch:save")
+async def save_channels_handler(query: CallbackQuery) -> None:
+    tg_user_id = query.from_user.id
+    draft = _channel_drafts.get(tg_user_id)
+    if not draft:
+        await query.answer("No changes to save.")
+        return
+
+    dialogs = await get_user_dialogs(tg_user_id)
+    dialog_map = {str(d["id"]): d for d in dialogs}
+    for d in dialogs:
+        if d.get("username"):
+            dialog_map[norm_channel(d["username"])] = d
+
+    # Build source channel objects
+    source_objs = []
+    for s in draft["sources"]:
+        d = dialog_map.get(s)
+        if d:
+            source_objs.append({"id": str(d["id"]), "title": d["title"], "username": d.get("username") or ""})
+        else:
+            source_objs.append({"id": s, "title": s, "username": s})
+
+    # Build target channel objects
+    target_objs = []
+    primary_target_id = None
+    primary_target_name = None
+    for t in draft["targets"]:
+        d = dialog_map.get(t)
+        if d:
+            target_objs.append({"id": str(d["id"]), "title": d["title"], "username": d.get("username") or ""})
+            if not primary_target_id:
+                primary_target_id = str(d["id"])
+                primary_target_name = d["title"]
+        else:
+            target_objs.append({"id": t, "title": t, "username": t})
+            if not primary_target_id:
+                primary_target_id = t
+                primary_target_name = t
+
+    res = await api_save_channels(
+        telegram_user_id=tg_user_id,
+        source_channels=source_objs,
+        target_channels=target_objs,
+        target_channel_id=primary_target_id,
+        target_channel_name=primary_target_name,
+    )
+
+    asyncio.create_task(refresh_configs())
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ View Status", callback_data="menu:status")],
+        [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu:main")],
+    ])
+
+    await query.message.edit_text(
+        "✅ <b>Channels Saved & Activated!</b>\n\n"
+        f"📥 <b>Source Channels:</b> {len(source_objs)} active\n"
+        f"📤 <b>Target Channels:</b> {len(target_objs)} active\n\n"
+        "🚀 The worker is monitoring your sources and will automatically convert "
+        "and post deals to your target channel!",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def noop_handler(query: CallbackQuery) -> None:
+    await query.answer()
+
+
+# --------------------------------------------------------------------------- #
+# Status & Help
+# --------------------------------------------------------------------------- #
+@router.message(Command("status"))
+@router.callback_query(F.data == "menu:status")
+async def cmd_status(event: Message | CallbackQuery) -> None:
+    tg_user = event.from_user
+    if tg_user is None:
+        return
+
+    # Check local store or fetch fresh
+    c = store.get_by_telegram_id(tg_user.id)
+    if not c:
+        rows = await api_fetch_configs(telegram_id=tg_user.id)
+        parsed = [p for p in (parse_config(r) for r in rows) if p]
+        if parsed:
+            c = parsed[0]
+
+    if not c:
+        text = (
+            "ℹ️ <b>No Linked Account Found</b>\n\n"
+            "Please open the website dashboard and tap <b>Connect Telegram</b>, "
+            "or connect your Telegram account with /login."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Login Telegram Account", callback_data="menu:login")],
+            [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu:main")],
+        ])
+    else:
+        target = c.target_channel_name or c.target_channel_id or "Not set"
+        session_status = "🟢 Connected" if c.session_string else "🟡 Using Bot / Not Connected"
+        text = (
+            "⚙️ <b>Automation Status</b>\n\n"
+            f"• <b>Status:</b> {'🟢 Active' if c.is_active else '🔴 Inactive'}\n"
+            f"• <b>SubID:</b> <code>{c.tracking_sub_id or 'N/A'}</code>\n"
+            f"• <b>Telegram Account:</b> {session_status}\n"
+            f"• <b>Target Channel:</b> <code>{target}</code>\n"
+            f"• <b>Source Channels:</b> {len(c.source_channels)}\n"
+            + ("\n".join(f"  ▫️ {x}" for x in c.source_channels[:8]))
+            + ("\n  <i>...and more</i>" if len(c.source_channels) > 8 else "")
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Select Channels", callback_data="menu:channels")],
+            [InlineKeyboardButton(text="🔄 Re-login", callback_data="menu:login")],
+            [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu:main")],
+        ])
+
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(HELP_TEXT, parse_mode="HTML")
+
+
+# --------------------------------------------------------------------------- #
+# Config Sync Worker Loop
+# --------------------------------------------------------------------------- #
+async def refresh_configs() -> None:
+    try:
+        rows = await api_fetch_configs()
+    except Exception as e:
+        log.warning("Config sync failed: %s", e)
+        return
+
+    users: dict[str, UserConfig] = {}
+    for r in rows:
+        cfg = parse_config(r)
+        if cfg:
+            users[cfg.user_id] = cfg
+    store.replace(users)
+    log.info("Config synced: %d active users, %d distinct sources", len(users), len(store.all_sources()))
+    await session_mgr.sync_user_sessions(users)
+
+
+async def config_sync_loop() -> None:
+    while True:
+        await refresh_configs()
+        await asyncio.sleep(SYNC_INTERVAL)
+
+
+# --------------------------------------------------------------------------- #
+# aiohttp Health-Check Server
+# --------------------------------------------------------------------------- #
+http_runner: Optional[web.AppRunner] = None
+
+
+async def health_check_handler(request: web.Request) -> web.Response:
+    return web.json_response({
+        "status": "ok",
+        "service": "kamaikaro-worker",
+        "active_users": len(store.users),
+        "active_sources": len(store.all_sources()),
+        "connected_sessions": len(session_mgr.clients),
+    })
+
+
+async def run_http_server() -> None:
+    global http_runner
+    app = web.Application()
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/health", health_check_handler)
+
+    http_runner = web.AppRunner(app)
+    await http_runner.setup()
+    site = web.TCPSite(http_runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    log.info("HTTP health-check server listening on port %d", PORT)
+    while True:
+        await asyncio.sleep(3600)
+
+
+# --------------------------------------------------------------------------- #
+# Bot Runner & Main Entrypoint
+# --------------------------------------------------------------------------- #
 async def run_bot(bot: Bot) -> None:
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     while True:
         try:
@@ -617,50 +1396,37 @@ async def run_bot(bot: Bot) -> None:
             await asyncio.sleep(5)
 
 
-# --------------------------------------------------------------------------- #
-# HTTP Health-check server (for Render Web Service)
-# --------------------------------------------------------------------------- #
-http_runner: Optional[web.AppRunner] = None
-
-
-async def health_check_handler(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "kamaikaro-worker"})
-
-
-async def run_http_server() -> None:
-    global http_runner
-    port = int(os.getenv("PORT", 8080))
-    app = web.Application()
-    app.router.add_get("/", health_check_handler)
-    app.router.add_get("/health", health_check_handler)
-
-    http_runner = web.AppRunner(app)
-    await http_runner.setup()
-    site = web.TCPSite(http_runner, host="0.0.0.0", port=port)
-    await site.start()
-    log.info("HTTP health-check server running on port %d", port)
-    while True:
-        await asyncio.sleep(3600)
+def validate_env() -> None:
+    missing = [k for k, v in {
+        "BOT_TOKEN": BOT_TOKEN,
+        "TELEGRAM_API_ID": API_ID,
+        "TELEGRAM_API_HASH": API_HASH,
+    }.items() if not v]
+    if missing:
+        raise SystemExit("Missing required env vars: " + ", ".join(missing))
 
 
 async def main() -> None:
     validate_env()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
-    log.info("Bot online as @%s", me.username)
+    log.info("Bot online as @%s (id=%d)", me.username, me.id)
+    session_mgr.set_bot(bot)
+
+    # Initial load of configs & clients
+    await refresh_configs()
+
     try:
         await asyncio.gather(
             run_http_server(),
             run_bot(bot),
             config_sync_loop(),
-            run_telethon(bot),
         )
     finally:
         await bot.session.close()
         if _session and not _session.closed:
             await _session.close()
-        if tele:
-            await tele.disconnect()
+        await session_mgr.disconnect_all()
         if http_runner:
             await http_runner.cleanup()
 
