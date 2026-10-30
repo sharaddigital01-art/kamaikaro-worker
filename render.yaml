@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: telegram-worker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELETHON_SESSION_STRING
+        sync: false
+      - key: WORKER_API_SECRET
+        sync: false
+      - key: CUELINKS_PUB_ID
+        value: "282274"
+      - key: CUELINKS_CHNL_ID
+        value: "332862"
+      - key: BASE_WEB_URL
+        value: https://kamai-three.vercel.app
+      - key: CONFIG_SYNC_INTERVAL
+        value: "60"
+      - key: PORT
+        value: "8080"
