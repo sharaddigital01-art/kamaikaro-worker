@@ -24,7 +24,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -103,6 +103,9 @@ _pending_logins: dict[int, dict[str, Any]] = {}
 # In-memory drafts for channel selection: tg_user_id -> dict
 _channel_drafts: dict[int, dict[str, set[str]]] = {}
 _dialogs_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
+
+# In-memory mapping of telegram_user_id -> verified user_id
+_telegram_to_user_id: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -271,10 +274,17 @@ async def api_save_session(session_string: str, telegram_user_id: int | str, tel
         return {"error": str(e), "_status": 500}
 
 
-async def api_save_channels(telegram_user_id: int | str, source_channels: list[dict], target_channels: list[dict], target_channel_id: Optional[str], target_channel_name: Optional[str]) -> dict:
+async def api_save_channels(
+    telegram_user_id: int | str,
+    source_channels: list[dict],
+    target_channels: list[dict],
+    target_channel_id: Optional[str],
+    target_channel_name: Optional[str],
+    user_id: Optional[str] = None,
+) -> dict:
     """POST /api/telegram/channels"""
     s = await http()
-    payload = {
+    payload: dict[str, Any] = {
         "telegramUserId": str(telegram_user_id),
         "sourceChannels": source_channels,
         "targetChannels": target_channels,
@@ -282,6 +292,8 @@ async def api_save_channels(telegram_user_id: int | str, source_channels: list[d
         "targetChannelName": target_channel_name,
         "isActive": True,
     }
+    if user_id:
+        payload["userId"] = str(user_id)
     try:
         async with s.post(CHANNELS_URL, json=payload) as r:
             try:
@@ -725,50 +737,133 @@ def get_main_menu_keyboard(is_logged_in: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+@router.message(CommandStart())
 @router.message(Command("start"))
-async def cmd_start(message: Message, command: CommandObject) -> None:
+async def cmd_start(message: Message, command: CommandObject = None, state: FSMContext = None) -> None:
     tg_user = message.from_user
     if tg_user is None:
         await message.answer("❌ Couldn't identify your Telegram account.")
         return
 
-    arg = (command.args or "").strip()
-    user_id = arg.replace("AUTH_", "").strip() if arg else ""
+    # 1. Extract start payload (support command.args or message.text)
+    arg = ""
+    if command and command.args:
+        arg = command.args.strip()
+    elif message.text and len(message.text.split(maxsplit=1)) > 1:
+        arg = message.text.split(maxsplit=1)[1].strip()
+
+    user_id = ""
+    if arg:
+        clean_arg = re.sub(r"^[?&]start=", "", arg).strip()
+        if clean_arg.startswith("AUTH_"):
+            user_id = clean_arg[len("AUTH_"):].strip()
+        else:
+            user_id = clean_arg.strip()
+        user_id = user_id.split("?")[0].split("&")[0].strip()
 
     if user_id:
+        # Save verified userId directly in memory and FSM state
+        _telegram_to_user_id[str(tg_user.id)] = user_id
+        if state:
+            await state.update_data(user_id=user_id)
+
         res = await api_verify_sync(user_id, tg_user.id, tg_user.username)
         sub_id = res.get("trackingSubId") or (res.get("user") or {}).get("trackingSubId")
-        if res.get("_status") == 200 and (res.get("success") is True or "successfully" in str(res.get("message") or "").lower()):
+        if not sub_id:
+            cfg_rows = await api_fetch_configs(user_id=user_id)
+            if cfg_rows:
+                sub_id = cfg_rows[0].get("trackingSubId")
+
+        status_code = res.get("_status")
+        is_success = (status_code == 200 or res.get("success") is True or "successfully" in str(res.get("message") or "").lower())
+
+        if is_success:
             asyncio.create_task(refresh_configs())
+            sub_id_display = sub_id if sub_id else "Configured in Dashboard"
             await message.answer(
                 f"✅ <b>Account Connected Successfully!</b>\n\n"
-                f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id or 'EK_tg'}</code>\n\n"
-                "👉 Connect your Telegram session below to let KamaiKaro read your channels:",
+                f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
+                f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id_display}</code>\n\n"
+                "👉 Tap <b>[📱 Login Telegram Account]</b> below to link your Telegram session so KamaiKaro can access your channels:",
                 reply_markup=get_main_menu_keyboard(is_logged_in=False),
                 parse_mode="HTML",
             )
             return
+        else:
+            err = res.get("error") or res.get("message") or f"HTTP {status_code}"
+            await message.answer(
+                f"❌ <b>Account Linking Failed:</b> {err}\n\n"
+                f"Please open your dashboard at <a href=\"{BASE_WEB_URL}/telegram-bot\">{BASE_WEB_URL}/telegram-bot</a> and click <b>Open in Telegram</b> to generate a valid connection link.",
+                parse_mode="HTML",
+            )
+            return
 
-    # Check if this user is already linked
+    # 2. No start payload: check if user is already linked in memory, state, or database
+    stored_user_id = _telegram_to_user_id.get(str(tg_user.id))
+    if not stored_user_id and state:
+        stored_user_id = (await state.get_data()).get("user_id")
+
     u_cfg = store.get_by_telegram_id(tg_user.id)
-    is_logged_in = bool(u_cfg and u_cfg.session_string)
+    if not stored_user_id and u_cfg and u_cfg.user_id:
+        stored_user_id = u_cfg.user_id
+        _telegram_to_user_id[str(tg_user.id)] = stored_user_id
 
+    if not stored_user_id:
+        db_rows = await api_fetch_configs(telegram_id=tg_user.id)
+        if db_rows and db_rows[0].get("userId"):
+            stored_user_id = db_rows[0]["userId"]
+            _telegram_to_user_id[str(tg_user.id)] = stored_user_id
+            if db_rows[0].get("trackingSubId") and not u_cfg:
+                u_cfg = parse_config(db_rows[0])
+
+    if stored_user_id:
+        if state:
+            await state.update_data(user_id=stored_user_id)
+        is_logged_in = bool(u_cfg and u_cfg.session_string)
+        sub_id = u_cfg.tracking_sub_id if u_cfg and u_cfg.tracking_sub_id else "Configured in Dashboard"
+        await message.answer(
+            f"👋 <b>Welcome back to KamaiKaro Deal Automation Bot!</b>\n\n"
+            f"👤 <b>Linked User ID:</b> <code>{stored_user_id}</code>\n"
+            f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id}</code>\n\n"
+            "Select an option below to manage your automation:",
+            reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in),
+            parse_mode="HTML",
+        )
+        return
+
+    # 3. No user ID found: prompt user to click "Open in Telegram" from web dashboard (NO dummy fallbacks)
+    dashboard_url = f"{BASE_WEB_URL}/telegram-bot"
+    unlinked_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Open Web Dashboard", url=dashboard_url)],
+        [InlineKeyboardButton(text="🔄 Try Again", callback_data="menu:main")],
+    ])
     await message.answer(
         "👋 <b>Welcome to KamaiKaro Deal Automation Bot!</b>\n\n"
-        "Automatically convert e-commerce deals with your personal affiliate SubID "
-        "and broadcast them into your channel 24x7.\n\n"
-        "Select an option below to get started:",
-        reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in),
+        "⚠️ <b>Account Not Linked</b>\n\n"
+        "Your Telegram account is not yet connected to a KamaiKaro user account.\n\n"
+        "👉 <b>How to connect:</b>\n"
+        f"1. Open your web dashboard: <a href=\"{dashboard_url}\">{dashboard_url}</a>\n"
+        "2. Click the <b>Connect Telegram</b> (or <b>Open in Telegram</b>) button.\n"
+        "3. Telegram will open and automatically link your account with your personal SubID!\n\n"
+        "<i>All deals and commissions will be tracked directly to your own account.</i>",
+        reply_markup=unlinked_kb,
         parse_mode="HTML",
+        disable_web_page_preview=True,
     )
 
 
 @router.callback_query(F.data == "menu:main")
-async def cb_main_menu(query: CallbackQuery) -> None:
-    u_cfg = store.get_by_telegram_id(query.from_user.id)
+async def cb_main_menu(query: CallbackQuery, state: FSMContext = None) -> None:
+    tg_user_id = query.from_user.id
+    stored_user_id = _telegram_to_user_id.get(str(tg_user_id))
+    if not stored_user_id and state:
+        stored_user_id = (await state.get_data()).get("user_id")
+
+    u_cfg = store.get_by_telegram_id(tg_user_id)
     is_logged_in = bool(u_cfg and u_cfg.session_string)
+    user_info = f"\n👤 <b>User ID:</b> <code>{stored_user_id}</code>\n" if stored_user_id else ""
     await query.message.edit_text(
-        "👋 <b>KamaiKaro Deal Automation Bot Menu</b>\n\n"
+        f"👋 <b>KamaiKaro Deal Automation Bot Menu</b>\n{user_info}\n"
         "Choose an action below:",
         reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in),
         parse_mode="HTML",
@@ -780,6 +875,8 @@ async def cb_main_menu(query: CallbackQuery) -> None:
 @router.callback_query(F.data == "login:cancel")
 async def cancel_handler(event: Message | CallbackQuery, state: FSMContext) -> None:
     tg_user_id = event.from_user.id
+    # Preserve user_id when clearing state
+    user_id = (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
     pending = _pending_logins.pop(tg_user_id, None)
     if pending:
         try:
@@ -787,6 +884,9 @@ async def cancel_handler(event: Message | CallbackQuery, state: FSMContext) -> N
         except Exception:
             pass
     await state.clear()
+    if user_id:
+        _telegram_to_user_id[str(tg_user_id)] = user_id
+        await state.update_data(user_id=user_id)
     msg = event.message if isinstance(event, CallbackQuery) else event
     await msg.answer("❌ Action cancelled. Tap /start to open the main menu.")
     if isinstance(event, CallbackQuery):
@@ -799,8 +899,40 @@ async def cancel_handler(event: Message | CallbackQuery, state: FSMContext) -> N
 @router.message(Command("login"))
 @router.callback_query(F.data == "menu:login")
 async def start_login(event: Message | CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     tg_user_id = event.from_user.id
+
+    # Retrieve verified user_id from state, memory, store, or database API
+    curr_data = await state.get_data()
+    user_id = curr_data.get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+    if not user_id:
+        u_cfg = store.get_by_telegram_id(tg_user_id)
+        if u_cfg and u_cfg.user_id:
+            user_id = u_cfg.user_id
+    if not user_id:
+        rows = await api_fetch_configs(telegram_id=tg_user_id)
+        if rows and rows[0].get("userId"):
+            user_id = rows[0]["userId"]
+
+    if not user_id:
+        dashboard_url = f"{BASE_WEB_URL}/telegram-bot"
+        unlinked_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Open Web Dashboard", url=dashboard_url)],
+            [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu:main")],
+        ])
+        text = (
+            "⚠️ <b>Account Not Linked</b>\n\n"
+            "We couldn't find your KamaiKaro user ID. You must connect your account before logging in to Telegram.\n\n"
+            f"👉 Please open your web dashboard (<a href=\"{dashboard_url}\">{dashboard_url}</a>) "
+            "and click <b>Open in Telegram</b> (or <b>Connect Telegram</b>)."
+        )
+        if isinstance(event, CallbackQuery):
+            await event.message.edit_text(text, reply_markup=unlinked_kb, parse_mode="HTML")
+            await event.answer()
+        else:
+            await event.answer(text, reply_markup=unlinked_kb, parse_mode="HTML")
+        return
+
+    _telegram_to_user_id[str(tg_user_id)] = user_id
     pending = _pending_logins.pop(tg_user_id, None)
     if pending:
         try:
@@ -808,14 +940,17 @@ async def start_login(event: Message | CallbackQuery, state: FSMContext) -> None
         except Exception:
             pass
 
+    # Preserve user_id in state
     await state.set_state(LoginFSM.waiting_for_phone)
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
+    await state.update_data(user_id=user_id)
 
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
     text = (
-        "📱 <b>Telegram Account Authentication</b>\n\n"
+        f"📱 <b>Telegram Account Authentication</b>\n\n"
+        f"👤 <b>Account ID:</b> <code>{user_id}</code>\n\n"
         "Please enter your Telegram phone number with international country code:\n"
         "Example: <code>+919876543210</code>\n\n"
-        "<i>Your session string will be created directly on this secure server.</i>"
+        "<i>Your session string will be linked directly to your KamaiKaro account.</i>"
     )
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(text, reply_markup=cancel_kb, parse_mode="HTML")
@@ -843,12 +978,16 @@ async def process_phone(message: Message, state: FSMContext) -> None:
         return
 
     tg_user_id = message.from_user.id
+    state_data = await state.get_data()
+    user_id = state_data.get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+
     _pending_logins[tg_user_id] = {
         "client": client,
         "phone": phone,
         "phone_code_hash": req.phone_code_hash,
+        "user_id": user_id,
     }
-    await state.update_data(phone=phone, phone_code_hash=req.phone_code_hash)
+    await state.update_data(phone=phone, phone_code_hash=req.phone_code_hash, user_id=user_id)
     await state.set_state(LoginFSM.waiting_for_otp)
 
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
@@ -875,6 +1014,7 @@ async def process_otp(message: Message, state: FSMContext) -> None:
     client: TelegramClient = pending["client"]
     phone = pending["phone"]
     phone_code_hash = pending["phone_code_hash"]
+    user_id = pending.get("user_id") or (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
 
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
@@ -896,7 +1036,7 @@ async def process_otp(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ Login failed: {e}\n\nPlease try again or /cancel:")
         return
 
-    await finish_login(message, state, client, tg_user_id)
+    await finish_login(message, state, client, tg_user_id, user_id=user_id)
 
 
 @router.message(LoginFSM.waiting_for_2fa)
@@ -910,6 +1050,8 @@ async def process_2fa(message: Message, state: FSMContext) -> None:
         return
 
     client: TelegramClient = pending["client"]
+    user_id = pending.get("user_id") or (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+
     try:
         await client.sign_in(password=password)
     except PasswordHashInvalidError:
@@ -920,21 +1062,37 @@ async def process_2fa(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ 2FA error: {e}\n\nPlease re-enter password or /cancel:")
         return
 
-    await finish_login(message, state, client, tg_user_id)
+    await finish_login(message, state, client, tg_user_id, user_id=user_id)
 
 
-async def finish_login(message: Message, state: FSMContext, client: TelegramClient, tg_user_id: int) -> None:
+async def finish_login(
+    message: Message,
+    state: FSMContext,
+    client: TelegramClient,
+    tg_user_id: int,
+    user_id: Optional[str] = None
+) -> None:
     session_str = client.session.save()
     tg_user = message.from_user
 
-    # Save to Next.js API
+    if not user_id:
+        state_data = await state.get_data()
+        user_id = state_data.get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+
+    log.info("Finishing login: telegram_user_id=%s, user_id=%s", tg_user_id, user_id)
+
+    # Save to Next.js API WITH explicit user_id!
     res = await api_save_session(
         session_string=session_str,
         telegram_user_id=tg_user_id,
         telegram_username=tg_user.username or "",
+        user_id=user_id,
     )
 
     await state.clear()
+    if user_id:
+        _telegram_to_user_id[str(tg_user_id)] = user_id
+        await state.update_data(user_id=user_id)
     _pending_logins.pop(tg_user_id, None)
 
     # Register live client
@@ -945,6 +1103,15 @@ async def finish_login(message: Message, state: FSMContext, client: TelegramClie
         [InlineKeyboardButton(text="📢 Select Channels", callback_data="menu:channels")],
         [InlineKeyboardButton(text="⚙️ Automation Status", callback_data="menu:status")],
     ])
+
+    user_info = f" (User ID: <code>{user_id}</code>)" if user_id else ""
+    await message.answer(
+        f"✅ <b>Account Linked Successfully!</b>{user_info}\n\n"
+        "Your Telegram account is now connected and authorized.\n\n"
+        "👉 Next step: tap <b>[📢 Select Channels]</b> to choose your source & target channels.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
     await message.answer(
         "✅ <b>Account Linked Successfully!</b>\n\n"
@@ -1009,9 +1176,18 @@ def build_channel_hub_kb(sources_count: int, targets_count: int) -> InlineKeyboa
 @router.message(Command("mychannels"))
 @router.callback_query(F.data == "menu:channels")
 @router.callback_query(F.data == "ch:hub")
-async def show_channel_hub(event: Message | CallbackQuery) -> None:
+async def show_channel_hub(event: Message | CallbackQuery, state: FSMContext = None) -> None:
     tg_user_id = event.from_user.id
     u_cfg = store.get_by_telegram_id(tg_user_id)
+    if not u_cfg:
+        try:
+            db_rows = await api_fetch_configs(telegram_id=tg_user_id)
+            if db_rows:
+                u_cfg = parse_config(db_rows[0])
+                if u_cfg and u_cfg.user_id:
+                    _telegram_to_user_id[str(tg_user_id)] = u_cfg.user_id
+        except Exception:
+            pass
 
     # Initialize draft selection if not present
     if tg_user_id not in _channel_drafts:
@@ -1194,12 +1370,29 @@ async def toggle_target_channel(query: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "ch:save")
-async def save_channels_handler(query: CallbackQuery) -> None:
+async def save_channels_handler(query: CallbackQuery, state: FSMContext = None) -> None:
     tg_user_id = query.from_user.id
     draft = _channel_drafts.get(tg_user_id)
     if not draft:
         await query.answer("No changes to save.")
         return
+
+    # Retrieve verified user_id
+    user_id = _telegram_to_user_id.get(str(tg_user_id))
+    if not user_id and state:
+        user_id = (await state.get_data()).get("user_id")
+    if not user_id:
+        cfg = store.get_by_telegram_id(tg_user_id)
+        if cfg and cfg.user_id:
+            user_id = cfg.user_id
+    if not user_id:
+        try:
+            db_rows = await api_fetch_configs(telegram_id=tg_user_id)
+            if db_rows and db_rows[0].get("userId"):
+                user_id = db_rows[0]["userId"]
+                _telegram_to_user_id[str(tg_user_id)] = user_id
+        except Exception:
+            pass
 
     dialogs = await get_user_dialogs(tg_user_id)
     dialog_map = {str(d["id"]): d for d in dialogs}
@@ -1239,6 +1432,7 @@ async def save_channels_handler(query: CallbackQuery) -> None:
         target_channels=target_objs,
         target_channel_id=primary_target_id,
         target_channel_name=primary_target_name,
+        user_id=user_id,
     )
 
     asyncio.create_task(refresh_configs())
@@ -1248,10 +1442,12 @@ async def save_channels_handler(query: CallbackQuery) -> None:
         [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu:main")],
     ])
 
+    user_info = f"\n🆔 <b>User ID:</b> <code>{user_id}</code>" if user_id else ""
     await query.message.edit_text(
         "✅ <b>Channels Saved & Activated!</b>\n\n"
         f"📥 <b>Source Channels:</b> {len(source_objs)} active\n"
-        f"📤 <b>Target Channels:</b> {len(target_objs)} active\n\n"
+        f"📤 <b>Target Channels:</b> {len(target_objs)} active"
+        f"{user_info}\n\n"
         "🚀 The worker is monitoring your sources and will automatically convert "
         "and post deals to your target channel!",
         reply_markup=kb,
@@ -1270,7 +1466,7 @@ async def noop_handler(query: CallbackQuery) -> None:
 # --------------------------------------------------------------------------- #
 @router.message(Command("status"))
 @router.callback_query(F.data == "menu:status")
-async def cmd_status(event: Message | CallbackQuery) -> None:
+async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -> None:
     tg_user = event.from_user
     if tg_user is None:
         return
@@ -1278,28 +1474,36 @@ async def cmd_status(event: Message | CallbackQuery) -> None:
     # Check local store or fetch fresh
     c = store.get_by_telegram_id(tg_user.id)
     if not c:
-        rows = await api_fetch_configs(telegram_id=tg_user.id)
+        uid = _telegram_to_user_id.get(str(tg_user.id))
+        if not uid and state:
+            uid = (await state.get_data()).get("user_id")
+        rows = await api_fetch_configs(telegram_id=tg_user.id, user_id=uid)
         parsed = [p for p in (parse_config(r) for r in rows) if p]
         if parsed:
             c = parsed[0]
+            if c.user_id:
+                _telegram_to_user_id[str(tg_user.id)] = c.user_id
 
     if not c:
         text = (
             "ℹ️ <b>No Linked Account Found</b>\n\n"
-            "Please open the website dashboard and tap <b>Connect Telegram</b>, "
+            "Please open your website dashboard and click <b>Connect Telegram</b> to link your account, "
             "or connect your Telegram account with /login."
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📱 Login Telegram Account", callback_data="menu:login")],
+            [InlineKeyboardButton(text="🌐 Open Dashboard", url=f"{BASE_WEB_URL}/telegram-bot")],
             [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu:main")],
         ])
     else:
         target = c.target_channel_name or c.target_channel_id or "Not set"
         session_status = "🟢 Connected" if c.session_string else "🟡 Using Bot / Not Connected"
+        sub_id = c.tracking_sub_id or "Not configured"
         text = (
             "⚙️ <b>Automation Status</b>\n\n"
+            f"• <b>User ID:</b> <code>{c.user_id}</code>\n"
             f"• <b>Status:</b> {'🟢 Active' if c.is_active else '🔴 Inactive'}\n"
-            f"• <b>SubID:</b> <code>{c.tracking_sub_id or 'N/A'}</code>\n"
+            f"• <b>SubID:</b> <code>{sub_id}</code>\n"
             f"• <b>Telegram Account:</b> {session_status}\n"
             f"• <b>Target Channel:</b> <code>{target}</code>\n"
             f"• <b>Source Channels:</b> {len(c.source_channels)}\n"
@@ -1339,6 +1543,8 @@ async def refresh_configs() -> None:
         cfg = parse_config(r)
         if cfg:
             users[cfg.user_id] = cfg
+            if cfg.telegram_user_id:
+                _telegram_to_user_id[str(cfg.telegram_user_id)] = cfg.user_id
     store.replace(users)
     log.info("Config synced: %d active users, %d distinct sources", len(users), len(store.all_sources()))
     await session_mgr.sync_user_sessions(users)
