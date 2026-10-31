@@ -159,7 +159,15 @@ class ConfigStore:
         for u in self.users.values():
             if not (u.is_active and (u.target_channel_id or u.target_channels)):
                 continue
-            user_sources = {norm_channel(c) for c in u.source_channels}
+            user_sources = set()
+            for c in u.source_channels:
+                norm = norm_channel(c)
+                if norm:
+                    user_sources.add(norm)
+                    if re.fullmatch(r"-?\d+", norm):
+                        raw_id = norm.lstrip("-")
+                        clean_id = re.sub(r"^100", "", raw_id)
+                        user_sources.update({norm, raw_id, clean_id, f"-100{clean_id}"})
             if user_sources & source_keys:
                 out.append(u)
         return out
@@ -175,7 +183,14 @@ class ConfigStore:
         s: set[str] = set()
         for u in self.users.values():
             if u.is_active:
-                s.update(norm_channel(c) for c in u.source_channels)
+                for c in u.source_channels:
+                    norm = norm_channel(c)
+                    if norm:
+                        s.add(norm)
+                        if re.fullmatch(r"-?\d+", norm):
+                            raw_id = norm.lstrip("-")
+                            clean_id = re.sub(r"^100", "", raw_id)
+                            s.update({norm, raw_id, clean_id, f"-100{clean_id}"})
         s.discard("")
         return s
 
@@ -245,8 +260,8 @@ async def api_verify_sync(user_id: str, telegram_user_id: int | str, telegram_us
         return {"error": str(e), "_status": 500}
 
 
-async def api_fetch_configs(telegram_id: Optional[int | str] = None, user_id: Optional[str] = None) -> list[dict]:
-    """GET /api/telegram/user-config"""
+async def api_fetch_configs(telegram_id: Optional[int | str] = None, user_id: Optional[str] = None) -> Optional[list[dict]]:
+    """GET /api/telegram/user-config. Returns list of configs, or None on failure."""
     s = await http()
     params: dict[str, str] = {}
     if telegram_id is not None:
@@ -257,14 +272,15 @@ async def api_fetch_configs(telegram_id: Optional[int | str] = None, user_id: Op
         params["activeOnly"] = "true"
 
     try:
-        async with s.get(CONFIG_URL, params=params) as r:
+        timeout = aiohttp.ClientTimeout(total=8.0, connect=3.0)
+        async with s.get(CONFIG_URL, params=params, timeout=timeout) as r:
             r.raise_for_status()
             data = await r.json(content_type=None)
             configs = data.get("configs") if isinstance(data, dict) else None
             return configs if isinstance(configs, list) else []
     except Exception as e:
         log.warning("api_fetch_configs error: %s", e)
-        return []
+        return None
 
 
 async def api_save_session(session_string: str, telegram_user_id: int | str, telegram_username: Optional[str], user_id: Optional[str] = None) -> dict:
@@ -353,9 +369,12 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
         source_names: list[str] = []
         for x in raw_sources:
             if isinstance(x, dict):
-                u = x.get("username") or x.get("id") or ""
-                if u:
-                    source_names.append(str(u))
+                uname = x.get("username")
+                cid = x.get("id")
+                if uname:
+                    source_names.append(str(uname))
+                if cid:
+                    source_names.append(str(cid))
             elif x:
                 source_names.append(str(x))
 
@@ -498,7 +517,7 @@ async def unshorten_url(url: str) -> str:
     # Method 1: aiohttp with allow_redirects=True (HEAD first, then GET)
     try:
         connector = aiohttp.TCPConnector(ssl=False)
-        timeout = aiohttp.ClientTimeout(total=8, connect=4)
+        timeout = aiohttp.ClientTimeout(total=4.0, connect=1.5, sock_read=2.5)
         async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as session:
             try:
                 async with session.head(url, allow_redirects=True) as resp:
@@ -519,34 +538,6 @@ async def unshorten_url(url: str) -> str:
                             resolved = loc
     except Exception as e:
         log.warning("aiohttp unshorten error for %s: %s", url, e)
-
-    # Method 2: Synchronous requests in thread executor fallback
-    if resolved == url:
-        def _sync_expand(u: str) -> str:
-            try:
-                import requests
-                # Try HEAD
-                try:
-                    r = requests.head(u, allow_redirects=True, timeout=5, headers=headers, verify=False)
-                    if r.url and r.url.startswith("http") and r.url != u:
-                        return r.url
-                except Exception:
-                    pass
-                # Try GET
-                r = requests.get(u, allow_redirects=True, timeout=5, headers=headers, verify=False)
-                if r.url and r.url.startswith("http") and r.url != u:
-                    return r.url
-            except Exception:
-                pass
-            return u
-
-        try:
-            loop = asyncio.get_running_loop()
-            sync_res = await loop.run_in_executor(None, _sync_expand, url)
-            if sync_res and sync_res.startswith("http") and sync_res != url:
-                resolved = sync_res
-        except Exception as e:
-            log.warning("Sync unshorten fallback error for %s: %s", url, e)
 
     _RESOLVED_CACHE[url] = resolved
     if len(_RESOLVED_CACHE) > 5000:
@@ -582,7 +573,7 @@ def to_cuelinks(url: str, sub_id: str) -> str:
 async def api_shorten_link(original_url: str, user_id: Optional[str] = None) -> Optional[str]:
     """Call web shortener API: POST ${BASE_WEB_URL}/api/links/shorten
     Request body: { "originalUrl": converted_cuelinks_url, "userId": user_id }
-    Returns branded short link (e.g. https://kamaikaro.in/{slug}) or None on failure.
+    Strict 3-second non-blocking timeout. Falls back cleanly to None on 404, 500, timeout, or error.
     """
     clean_orig = clean_url_formatting(original_url)
     if not clean_orig:
@@ -593,9 +584,9 @@ async def api_shorten_link(original_url: str, user_id: Optional[str] = None) -> 
     if user_id:
         payload["userId"] = str(user_id)
 
-    try:
+    async def _request_shorten() -> Optional[str]:
         s = await http()
-        timeout = aiohttp.ClientTimeout(total=5, connect=3)
+        timeout = aiohttp.ClientTimeout(total=2.8, connect=1.2, sock_read=1.8)
         async with s.post(endpoint, json=payload, timeout=timeout) as resp:
             if resp.status in (200, 201):
                 try:
@@ -617,12 +608,18 @@ async def api_shorten_link(original_url: str, user_id: Optional[str] = None) -> 
 
                         if short_url and isinstance(short_url, str) and short_url.startswith("http"):
                             return clean_url_formatting(short_url)
-                except Exception as ex:
-                    log.warning("JSON parsing error in api_shorten_link: %s", ex)
+                except Exception as json_err:
+                    log.warning("JSON parse error in api_shorten_link: %s; fallback to direct Cuelinks", json_err)
             else:
-                log.warning("api_shorten_link HTTP %d: %s", resp.status, await resp.text())
+                log.warning("api_shorten_link HTTP %d: %s; fallback to direct Cuelinks", resp.status, await resp.text())
+        return None
+
+    try:
+        return await asyncio.wait_for(_request_shorten(), timeout=3.0)
+    except asyncio.TimeoutError:
+        log.warning("api_shorten_link timed out (>3s) for %s; fallback to direct Cuelinks", clean_orig[:60])
     except Exception as e:
-        log.warning("api_shorten_link failed for %s: %s", clean_orig[:60], e)
+        log.warning("api_shorten_link failed for %s (%s); fallback to direct Cuelinks", clean_orig[:60], e)
 
     return None
 
@@ -639,24 +636,50 @@ async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) ->
     # Process longest URLs first to avoid partial replacements
     for u in sorted(urls, key=len, reverse=True):
         try:
-            target_url = await unshorten_url(u) if is_shortened_url(u) else u
+            # Guarantee a working Cuelinks URL beforehand
+            base_cuelink = clean_url_formatting(to_cuelinks(u, sub_id))
+
+            # Unshorten redirect URLs with 4-second timeout protection
+            target_url = u
+            if is_shortened_url(u):
+                try:
+                    target_url = await asyncio.wait_for(unshorten_url(u), timeout=4.0)
+                except Exception as unshort_err:
+                    log.warning("Unshorten failed for %s (%s); using original link", u, unshort_err)
+                    target_url = u
+
             clean_url = strip_affiliate_params(target_url)
-
             dest_host = urlparse(clean_url).netloc.lower().split(":")[0]
-            if dest_host and not any(dest_host == d or dest_host.endswith("." + d) for d in EXCLUDED_DOMAINS):
-                cuelink = to_cuelinks(clean_url, sub_id)
 
-                # Attempt custom Kamaikaro link shortening
+            if dest_host and not any(dest_host == d or dest_host.endswith("." + d) for d in EXCLUDED_DOMAINS):
+                cuelink = clean_url_formatting(to_cuelinks(clean_url, sub_id))
+
+                # Attempt custom Kamaikaro link shortening (strict 3-sec non-blocking timeout)
                 short_url = None
                 if user_id:
-                    short_url = await api_shorten_link(cuelink, user_id=user_id)
+                    try:
+                        short_url = await api_shorten_link(cuelink, user_id=user_id)
+                    except Exception as short_err:
+                        log.warning("api_shorten_link error in convert_text: %s; falling back to Cuelinks link", short_err)
+                        short_url = None
 
-                final_link = clean_url_formatting(short_url) if short_url else clean_url_formatting(cuelink)
+                # Clean single-line Cuelinks URL fallback if shortener returned None or failed
+                final_link = clean_url_formatting(short_url) if short_url else cuelink
                 text = text.replace(u, final_link)
                 converted_count += 1
-                log.info("Converted deal link: %s -> %s -> %s", u, clean_url[:60], final_link)
+                log.info("Converted deal link: %s -> %s", u, final_link)
+            else:
+                # Still replace with guaranteed base cuelink if valid deal target
+                text = text.replace(u, base_cuelink)
+                converted_count += 1
         except Exception as e:
-            log.warning("Error converting deal URL %s: %s", u, e)
+            log.warning("Error in convert_text for URL %s: %s; applying direct Cuelinks fallback", u, e)
+            try:
+                fallback_link = clean_url_formatting(to_cuelinks(u, sub_id))
+                text = text.replace(u, fallback_link)
+                converted_count += 1
+            except Exception:
+                pass
             continue
 
     return text, converted_count
@@ -732,7 +755,15 @@ class MultiSessionManager:
                     pass
 
             try:
-                client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+                client = TelegramClient(
+                    StringSession(session_str),
+                    API_ID,
+                    API_HASH,
+                    auto_reconnect=True,
+                    connection_retries=None,
+                    retry_delay=2,
+                    timeout=15,
+                )
                 await client.connect()
                 if not await client.is_user_authorized():
                     log.warning("Session string for %s is not authorized/expired.", name)
@@ -742,12 +773,14 @@ class MultiSessionManager:
                 @client.on(events.NewMessage(incoming=True))
                 async def _on_msg(event: Any) -> None:
                     try:
+                        if not getattr(event, "message", None):
+                            return
                         if not (event.is_channel or event.is_group):
                             return
                         if self.bot_instance:
                             await handle_new_post(event, self.bot_instance)
-                    except Exception:
-                        log.exception("Unhandled error in _on_msg event listener")
+                    except Exception as err:
+                        log.error("Unhandled error in _on_msg event listener: %s", err, exc_info=True)
 
                 self.clients[session_str] = client
                 log.info("Telethon client [%s] connected & listening.", name)
@@ -755,6 +788,29 @@ class MultiSessionManager:
             except Exception as e:
                 log.warning("Failed to initialize Telethon client for %s: %s", name, e)
                 return None
+
+    async def keep_alive_loop(self) -> None:
+        """Periodic keepalive and auto-reconnect monitor for all registered Telethon clients."""
+        log.info("Telethon multi-session keepalive monitor active.")
+        while True:
+            try:
+                async with self._lock:
+                    clients_snapshot = list(self.clients.items())
+
+                for session_str, client in clients_snapshot:
+                    try:
+                        if not client.is_connected():
+                            log.warning("Telethon client detected disconnected; attempting auto-reconnect...")
+                            await client.connect()
+                            if await client.is_user_authorized():
+                                log.info("Telethon client auto-reconnected and authorized.")
+                            else:
+                                log.warning("Telethon client reconnected but session unauthorized.")
+                    except Exception as conn_err:
+                        log.warning("Client auto-reconnect attempt failed (%s); will retry next cycle", conn_err)
+            except Exception as loop_err:
+                log.warning("Error in session_mgr keep_alive_loop: %s", loop_err)
+            await asyncio.sleep(15)
 
     async def sync_user_sessions(self, users: dict[str, UserConfig]) -> None:
         # Also ensure the default worker SESSION_STRING is active if provided
@@ -775,12 +831,14 @@ class MultiSessionManager:
         @client.on(events.NewMessage(incoming=True))
         async def _on_msg(event: Any) -> None:
             try:
+                if not getattr(event, "message", None):
+                    return
                 if not (event.is_channel or event.is_group):
                     return
                 if self.bot_instance:
                     await handle_new_post(event, self.bot_instance)
-            except Exception:
-                log.exception("Unhandled error in user _on_msg listener")
+            except Exception as err:
+                log.error("Unhandled error in user _on_msg listener: %s", err, exc_info=True)
 
     async def get_client_for_telegram_id(self, telegram_user_id: int | str) -> Optional[TelegramClient]:
         s_id = str(telegram_user_id).strip()
@@ -819,10 +877,13 @@ def chat_keys(chat: Any) -> set[str]:
     keys = set()
     uname = getattr(chat, "username", None)
     if uname:
-        keys.add(uname.lower())
+        keys.add(uname.lower().lstrip("@"))
     cid = getattr(chat, "id", None)
     if cid is not None:
-        keys.update({str(cid), f"-100{cid}", str(abs(cid))})
+        raw_id = str(cid)
+        abs_id = str(abs(cid))
+        clean_id = re.sub(r"^-?100", "", abs_id)
+        keys.update({raw_id, abs_id, clean_id, f"-100{clean_id}", f"-{clean_id}"})
     return keys
 
 
@@ -939,8 +1000,22 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
                 for k in list(_seen_posts.keys())[:3000]:
                     _seen_posts.pop(k, None)
 
-        chat = await event.get_chat()
-        c_keys = chat_keys(chat)
+        chat = getattr(event, "chat", None)
+        if chat is None:
+            try:
+                chat = await asyncio.wait_for(event.get_chat(), timeout=3.0)
+            except Exception as e:
+                log.debug("event.get_chat timed out/failed: %s", e)
+
+        c_keys = set()
+        if chat:
+            c_keys.update(chat_keys(chat))
+        if chat_id is not None:
+            raw_id = str(chat_id)
+            abs_id = str(abs(chat_id))
+            clean_id = re.sub(r"^-?100", "", abs_id)
+            c_keys.update({raw_id, abs_id, clean_id, f"-100{clean_id}", f"-{clean_id}"})
+
         active_sources = store.all_sources()
 
         # If active source channels are monitored, only proceed if chat matches
@@ -974,18 +1049,24 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
         if not has_text and not is_real_media:
             return
 
-        # Unshorten any shortened deal links beforehand in parallel
+        # Unshorten any shortened deal links beforehand in parallel with timeout
         deal_urls = extract_deal_urls(display_text)
         shortened = [u for u in deal_urls if is_shortened_url(u)]
         if shortened:
-            await asyncio.gather(*(unshorten_url(u) for u in shortened), return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(unshorten_url(u) for u in shortened), return_exceptions=True),
+                    timeout=5.0,
+                )
+            except Exception as unshort_batch_err:
+                log.warning("Parallel unshorten batch timed out: %s", unshort_batch_err)
 
         # Download media to disk for bot fallback if real media is present
         media_path = None
         if is_real_media:
             try:
                 temp_dir = tempfile.gettempdir()
-                media_path = await msg.download_media(file=temp_dir)
+                media_path = await asyncio.wait_for(msg.download_media(file=temp_dir), timeout=15.0)
             except Exception as media_err:
                 log.warning("Media download failed (%s); continuing with native Telethon media or text", media_err)
 
@@ -995,15 +1076,16 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
                 return_exceptions=True,
             )
             ok = sum(1 for r in results if r is True)
-            log.info("Post from %s fanned out: %d/%d delivered", getattr(chat, "username", chat.id), ok, len(users))
+            chat_title = getattr(chat, "username", getattr(chat, "title", chat_id))
+            log.info("Post from %s fanned out: %d/%d delivered", chat_title, ok, len(users))
         finally:
             if media_path and os.path.exists(media_path):
                 try:
                     os.remove(media_path)
                 except OSError:
                     pass
-    except Exception:
-        log.exception("Error in handle_new_post listener")
+    except Exception as e:
+        log.error("Unhandled error in handle_new_post listener: %s", e, exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -2015,18 +2097,30 @@ async def refresh_configs() -> None:
         log.warning("Config sync failed: %s", e)
         return
 
+    if rows is None:
+        log.warning("Config sync API error or timeout; retaining %d cached users & %d sources to avoid deal stoppage.", len(store.users), len(store.all_sources()))
+        return
+
+    if len(rows) == 0 and len(store.users) > 0:
+        log.warning("Config sync returned 0 rows but store currently has %d active users; retaining cached configurations.", len(store.users))
+        return
+
     users: dict[str, UserConfig] = {}
     for r in rows:
         cfg = parse_config(r)
-        if cfg:
+        if cfg and cfg.is_active:
             users[cfg.user_id] = cfg
             if cfg.telegram_user_id:
                 _telegram_to_user_id[str(cfg.telegram_user_id)] = cfg.user_id
                 if cfg.tracking_sub_id:
                     _telegram_to_sub_id[str(cfg.telegram_user_id)] = cfg.tracking_sub_id
-    store.replace(users)
-    log.info("Config synced: %d active users, %d distinct sources", len(users), len(store.all_sources()))
-    await session_mgr.sync_user_sessions(users)
+
+    if users:
+        store.replace(users)
+        log.info("Config synced: %d active users, %d distinct sources: %s", len(users), len(store.all_sources()), list(store.all_sources())[:5])
+        await session_mgr.sync_user_sessions(users)
+    elif not store.users:
+        store.replace({})
 
 
 async def config_sync_loop() -> None:
@@ -2042,12 +2136,15 @@ http_runner: Optional[web.AppRunner] = None
 
 
 async def health_check_handler(request: web.Request) -> web.Response:
+    sources = list(store.all_sources())
     return web.json_response({
         "status": "ok",
         "service": "kamaikaro-worker",
         "active_users": len(store.users),
-        "active_sources": len(store.all_sources()),
-        "connected_sessions": len(session_mgr.clients),
+        "active_sources": len(sources),
+        "source_channels": sources[:25],
+        "connected_sessions": sum(1 for c in session_mgr.clients.values() if c.is_connected()),
+        "total_sessions": len(session_mgr.clients),
     })
 
 
@@ -2106,6 +2203,7 @@ async def main() -> None:
             run_http_server(),
             run_bot(bot),
             config_sync_loop(),
+            session_mgr.keep_alive_loop(),
         )
     finally:
         await bot.session.close()
