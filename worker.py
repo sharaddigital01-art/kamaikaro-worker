@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Any
@@ -138,7 +139,7 @@ class ConfigStore:
     def active_for_source(self, source_keys: set[str]) -> list[UserConfig]:
         out = []
         for u in self.users.values():
-            if not (u.is_active and (u.target_channel_id or u.target_channels) and u.tracking_sub_id):
+            if not (u.is_active and (u.target_channel_id or u.target_channels)):
                 continue
             user_sources = {norm_channel(c) for c in u.source_channels}
             if user_sources & source_keys:
@@ -310,6 +311,21 @@ async def api_save_channels(
         return {"error": str(e), "_status": 500}
 
 
+async def api_save_user_config(payload: dict[str, Any]) -> dict:
+    """POST /api/telegram/user-config"""
+    s = await http()
+    try:
+        async with s.post(CONFIG_URL, json=payload) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
+                data = {"_status": r.status}
+            return data if isinstance(data, dict) else {"message": str(data)}
+    except Exception as e:
+        log.warning("api_save_user_config error: %s", e)
+        return {"error": str(e), "_status": 500}
+
+
 def parse_config(raw: dict) -> Optional[UserConfig]:
     try:
         raw_sources = raw.get("sourceChannels") or []
@@ -449,23 +465,153 @@ async def unshorten_url(url: str) -> str:
     return resolved
 
 
+def clean_url_formatting(url: str) -> str:
+    """Ensure URL is completely contiguous without spaces, newlines, or splits."""
+    if not url:
+        return ""
+    cleaned = url.strip()
+    cleaned = re.sub(r"[\r\n\t\s]+", "", cleaned)
+    cleaned = re.sub(r"(https?://)\s+", r"\1", cleaned)
+    return cleaned
+
+
+def fix_split_urls(text: str) -> str:
+    """Fix any accidental splits around https:// or http:// in text."""
+    if not text:
+        return ""
+    return re.sub(r"(https?://)[\s\r\n]+([a-zA-Z0-9])", r"\1\2", text)
+
+
 def to_cuelinks(url: str, sub_id: str) -> str:
-    clean = strip_affiliate_params(url)
+    clean = strip_affiliate_params(clean_url_formatting(url))
     encoded_target_url = quote(clean, safe="")
-    return f"https://linksredirect.com/?pub_id={CUELINKS_PUB_ID}&chnl_id={CUELINKS_CHNL_ID}&subid={sub_id}&url={encoded_target_url}"
+    sub_id_clean = clean_url_formatting(sub_id)
+    raw_cuelink = f"https://linksredirect.com/?pub_id={CUELINKS_PUB_ID}&chnl_id={CUELINKS_CHNL_ID}&subid={sub_id_clean}&url={encoded_target_url}"
+    return clean_url_formatting(raw_cuelink)
 
 
-async def convert_text(text: str, sub_id: str) -> tuple[str, int]:
+async def api_shorten_link(original_url: str, user_id: Optional[str] = None) -> Optional[str]:
+    """Call web shortener API: POST ${BASE_WEB_URL}/api/links/shorten
+    Request body: { "originalUrl": converted_cuelinks_url, "userId": user_id }
+    Returns branded short link (e.g. https://kamaikaro.in/{slug}) or None on failure.
+    """
+    clean_orig = clean_url_formatting(original_url)
+    if not clean_orig:
+        return None
+
+    endpoint = f"{BASE_WEB_URL}/api/links/shorten"
+    payload: dict[str, Any] = {"originalUrl": clean_orig}
+    if user_id:
+        payload["userId"] = str(user_id)
+
+    try:
+        s = await http()
+        timeout = aiohttp.ClientTimeout(total=5, connect=3)
+        async with s.post(endpoint, json=payload, timeout=timeout) as resp:
+            if resp.status in (200, 201):
+                try:
+                    data = await resp.json(content_type=None)
+                    if isinstance(data, dict):
+                        short_url = (
+                            data.get("shortUrl")
+                            or data.get("shortenedUrl")
+                            or data.get("url")
+                            or (data.get("link") or {}).get("shortUrl")
+                            or (data.get("link") or {}).get("url")
+                            or (data.get("data") or {}).get("shortUrl")
+                            or (data.get("data") or {}).get("url")
+                        )
+                        if not short_url and data.get("slug"):
+                            short_url = f"https://kamaikaro.in/{data['slug']}"
+                        elif not short_url and (data.get("link") or {}).get("slug"):
+                            short_url = f"https://kamaikaro.in/{data['link']['slug']}"
+
+                        if short_url and isinstance(short_url, str) and short_url.startswith("http"):
+                            return clean_url_formatting(short_url)
+                except Exception as ex:
+                    log.warning("JSON parsing error in api_shorten_link: %s", ex)
+            else:
+                log.warning("api_shorten_link HTTP %d: %s", resp.status, await resp.text())
+    except Exception as e:
+        log.warning("api_shorten_link failed for %s: %s", clean_orig[:60], e)
+
+    return None
+
+
+async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) -> tuple[str, int]:
+    if not text:
+        return text, 0
+
     urls = extract_deal_urls(text)
+    if not urls:
+        return text, 0
+
     converted_count = 0
+    # Process longest URLs first to avoid partial replacements
     for u in sorted(urls, key=len, reverse=True):
-        target_url = await unshorten_url(u) if is_shortened_url(u) else u
-        clean_url = strip_affiliate_params(target_url)
-        if is_supported_product_host(urlparse(clean_url).netloc) or not is_shortened_url(clean_url):
-            cuelink = to_cuelinks(clean_url, sub_id)
-            text = text.replace(u, cuelink)
-            converted_count += 1
+        try:
+            target_url = await unshorten_url(u) if is_shortened_url(u) else u
+            clean_url = strip_affiliate_params(target_url)
+
+            netloc = urlparse(clean_url).netloc
+            if is_supported_product_host(netloc) or not is_shortened_url(clean_url):
+                cuelink = to_cuelinks(clean_url, sub_id)
+
+                # Attempt custom Kamaikaro link shortening
+                short_url = None
+                if user_id:
+                    short_url = await api_shorten_link(cuelink, user_id=user_id)
+
+                final_link = clean_url_formatting(short_url) if short_url else clean_url_formatting(cuelink)
+                text = text.replace(u, final_link)
+                converted_count += 1
+        except Exception as e:
+            log.warning("Error converting deal URL %s: %s", u, e)
+            continue
+
     return text, converted_count
+
+
+async def resolve_user_sub_id(user: UserConfig) -> str:
+    """Strictly resolve user's SubID from memory/state or database. No dummy fallbacks."""
+    sub_id = user.tracking_sub_id or _telegram_to_sub_id.get(str(user.telegram_user_id))
+
+    if not sub_id and user.user_id:
+        try:
+            configs = await api_fetch_configs(user_id=user.user_id)
+            if configs:
+                sub_id = (
+                    configs[0].get("trackingSubId")
+                    or configs[0].get("subId")
+                    or (configs[0].get("user") or {}).get("trackingSubId")
+                    or (configs[0].get("user") or {}).get("subId")
+                    or ""
+                )
+                if sub_id:
+                    user.tracking_sub_id = sub_id
+                    if user.telegram_user_id:
+                        _telegram_to_sub_id[str(user.telegram_user_id)] = sub_id
+        except Exception as e:
+            log.warning("Dynamic sub_id fetch by userId %s failed: %s", user.user_id, e)
+
+    if not sub_id and user.telegram_user_id:
+        try:
+            configs = await api_fetch_configs(telegram_id=user.telegram_user_id)
+            if configs:
+                sub_id = (
+                    configs[0].get("trackingSubId")
+                    or configs[0].get("subId")
+                    or (configs[0].get("user") or {}).get("trackingSubId")
+                    or (configs[0].get("user") or {}).get("subId")
+                    or ""
+                )
+                if sub_id:
+                    user.tracking_sub_id = sub_id
+                    _telegram_to_sub_id[str(user.telegram_user_id)] = sub_id
+        except Exception as e:
+            log.warning("Dynamic sub_id fetch by telegramId %s failed: %s", user.telegram_user_id, e)
+
+    return sub_id or ""
 
 
 # --------------------------------------------------------------------------- #
@@ -505,13 +651,13 @@ class MultiSessionManager:
 
                 @client.on(events.NewMessage(incoming=True))
                 async def _on_msg(event: Any) -> None:
-                    if not (event.is_channel or event.is_group):
-                        return
-                    if self.bot_instance:
-                        try:
+                    try:
+                        if not (event.is_channel or event.is_group):
+                            return
+                        if self.bot_instance:
                             await handle_new_post(event, self.bot_instance)
-                        except Exception:
-                            log.exception("Error in handle_new_post")
+                    except Exception:
+                        log.exception("Unhandled error in _on_msg event listener")
 
                 self.clients[session_str] = client
                 log.info("Telethon client [%s] connected & listening.", name)
@@ -538,13 +684,13 @@ class MultiSessionManager:
 
         @client.on(events.NewMessage(incoming=True))
         async def _on_msg(event: Any) -> None:
-            if not (event.is_channel or event.is_group):
-                return
-            if self.bot_instance:
-                try:
+            try:
+                if not (event.is_channel or event.is_group):
+                    return
+                if self.bot_instance:
                     await handle_new_post(event, self.bot_instance)
-                except Exception:
-                    log.exception("Error in user handle_new_post")
+            except Exception:
+                log.exception("Unhandled error in user _on_msg listener")
 
     async def get_client_for_telegram_id(self, telegram_user_id: int | str) -> Optional[TelegramClient]:
         s_id = str(telegram_user_id).strip()
@@ -590,11 +736,21 @@ def chat_keys(chat: Any) -> set[str]:
     return keys
 
 
-async def post_to_user(bot: Bot, user: UserConfig, text: str, media_path: Optional[str]) -> None:
-    converted, n = await convert_text(text, user.tracking_sub_id)
-    if n == 0:
-        return
+async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> None:
+    # 1. Strictly resolve active user's SubID from memory/state or database
+    sub_id = await resolve_user_sub_id(user)
 
+    # 2. Convert deal links using Cuelinks and Kamaikaro link shortener
+    if sub_id:
+        converted, n = await convert_text(text, sub_id, user_id=user.user_id)
+    else:
+        converted = text
+        n = 0
+
+    # Clean formatting on final text to avoid split links
+    converted = fix_split_urls(converted)
+
+    # 3. Resolve user's target channels
     targets = []
     if user.target_channel_id:
         targets.append(user.target_channel_id)
@@ -604,32 +760,70 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, media_path: Option
             targets.append(t_id)
 
     if not targets:
+        log.warning("User %s has no target channels configured; skipping delivery", user.user_id)
         return
 
+    is_real_media = bool(
+        getattr(msg, "photo", None)
+        or getattr(msg, "video", None)
+        or getattr(msg, "document", None)
+        or (getattr(msg, "media", None) and not hasattr(msg.media, "webpage"))
+    )
+
+    u_client = await session_mgr.get_client_for_telegram_id(user.telegram_user_id)
+
+    # 4. Post to each target channel
     for target in targets:
-        try:
-            if media_path:
-                caption = converted[:CAPTION_LIMIT]
-                await bot.send_photo(target, FSInputFile(media_path), caption=caption, parse_mode=None)
-                if len(converted) > CAPTION_LIMIT:
-                    await bot.send_message(target, converted[CAPTION_LIMIT:CAPTION_LIMIT + MESSAGE_LIMIT],
-                                           parse_mode=None, disable_web_page_preview=True)
-            else:
-                await bot.send_message(target, converted[:MESSAGE_LIMIT], parse_mode=None)
-        except Exception as bot_err:
-            log.warning("Bot posting to %s failed (%s); trying via user client session...", target, bot_err)
-            u_client = await session_mgr.get_client_for_telegram_id(user.telegram_user_id)
-            if u_client:
-                try:
-                    await u_client.send_message(target, converted, file=media_path)
-                    log.info("Posted via user client to %s", target)
-                except Exception as client_err:
-                    log.error("User client posting also failed to %s: %s", target, client_err)
+        posted = False
+        # Try Telethon native media sender via user client first
+        if u_client and u_client.is_connected():
+            try:
+                if is_real_media and (getattr(msg, "media", None) or media_path):
+                    file_to_send = msg.media if getattr(msg, "media", None) else media_path
+                    if len(converted) <= CAPTION_LIMIT:
+                        await u_client.send_file(target, file=file_to_send, caption=converted)
+                    else:
+                        # If caption exceeds 1024-character limit for media:
+                        # send the photo/media first and immediately send the deal text as follow-up reply
+                        sent_media = await u_client.send_file(target, file=file_to_send)
+                        reply_id = getattr(sent_media, "id", None)
+                        await u_client.send_message(target, converted[:MESSAGE_LIMIT], reply_to=reply_id)
+                else:
+                    await u_client.send_message(target, converted[:MESSAGE_LIMIT])
+                posted = True
+                log.info("Posted deal to target %s via user Telethon client for user %s", target, user.user_id)
+            except Exception as client_err:
+                log.warning("User Telethon client posting to %s failed: %s; trying Bot fallback...", target, client_err)
+
+        # Fallback to Aiogram Bot
+        if not posted and bot:
+            try:
+                if is_real_media and media_path and os.path.exists(media_path):
+                    file_input = FSInputFile(media_path)
+                    if len(converted) <= CAPTION_LIMIT:
+                        try:
+                            await bot.send_photo(target, file_input, caption=converted, parse_mode=None)
+                        except Exception:
+                            await bot.send_document(target, file_input, caption=converted, parse_mode=None)
+                    else:
+                        # Exceeds 1024-char limit: send media first, follow-up with deal text
+                        try:
+                            sent = await bot.send_photo(target, file_input, parse_mode=None)
+                            await bot.send_message(target, converted[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, parse_mode=None)
+                        except Exception:
+                            sent = await bot.send_document(target, file_input, parse_mode=None)
+                            await bot.send_message(target, converted[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, parse_mode=None)
+                else:
+                    await bot.send_message(target, converted[:MESSAGE_LIMIT], parse_mode=None)
+                posted = True
+                log.info("Posted deal to target %s via Bot for user %s", target, user.user_id)
+            except Exception as bot_err:
+                log.error("Bot posting also failed to %s for user %s: %s", target, user.user_id, bot_err)
 
 
-async def safe_post(bot: Bot, user: UserConfig, text: str, media_path: Optional[str]) -> bool:
+async def safe_post(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> bool:
     try:
-        await post_to_user(bot, user, text, media_path)
+        await post_to_user(bot, user, text, msg, media_path)
         return True
     except Exception as e:
         log.error("safe_post failed for user %s: %s", user.user_id, e)
@@ -637,73 +831,89 @@ async def safe_post(bot: Bot, user: UserConfig, text: str, media_path: Optional[
 
 
 async def handle_new_post(event: Any, bot: Bot) -> None:
-    msg = event.message
-    if not msg:
-        return
-
-    # Deduplication
-    chat_id = getattr(event, "chat_id", None)
-    msg_id = getattr(msg, "id", None)
-    if chat_id is not None and msg_id is not None:
-        dedup_key = (chat_id, msg_id)
-        now = time.time()
-        if dedup_key in _seen_posts and (now - _seen_posts[dedup_key]) < 600:
+    try:
+        msg = event.message
+        if not msg:
             return
-        _seen_posts[dedup_key] = now
-        if len(_seen_posts) > 10000:
-            for k in list(_seen_posts.keys())[:3000]:
-                _seen_posts.pop(k, None)
 
-    text = msg.message or ""
-    for ent in (msg.entities or []):
-        url = getattr(ent, "url", None)
-        if url:
-            text += "\n" + url
+        # Deduplication
+        chat_id = getattr(event, "chat_id", None)
+        msg_id = getattr(msg, "id", None)
+        if chat_id is not None and msg_id is not None:
+            dedup_key = (chat_id, msg_id)
+            now = time.time()
+            if dedup_key in _seen_posts and (now - _seen_posts[dedup_key]) < 600:
+                return
+            _seen_posts[dedup_key] = now
+            if len(_seen_posts) > 10000:
+                for k in list(_seen_posts.keys())[:3000]:
+                    _seen_posts.pop(k, None)
 
-    if not extract_deal_urls(text):
-        return
+        chat = await event.get_chat()
+        c_keys = chat_keys(chat)
+        active_sources = store.all_sources()
 
-    chat = await event.get_chat()
-    c_keys = chat_keys(chat)
-    users = store.active_for_source(c_keys)
-    if not users:
-        return
+        # If active source channels are monitored, only proceed if chat matches
+        if active_sources and not (c_keys & active_sources):
+            return
 
-    display_text = msg.message or ""
-    for ent in sorted(msg.entities or [], key=lambda e: -e.offset):
-        url = getattr(ent, "url", None)
-        if url and _host_matches(urlparse(url).netloc):
-            display_text = display_text[:ent.offset] + url + display_text[ent.offset + ent.length:]
-    if display_text.strip() == "":
-        display_text = text
+        users = store.active_for_source(c_keys)
+        if not users:
+            return
 
-    deal_urls = extract_deal_urls(display_text)
-    if not deal_urls:
-        return
-    shortened = [u for u in deal_urls if is_shortened_url(u)]
-    if shortened:
-        await asyncio.gather(*(unshorten_url(u) for u in shortened), return_exceptions=True)
+        raw_text = msg.message or ""
+        display_text = fix_split_urls(raw_text)
 
-    media_path = None
-    try:
-        if getattr(msg, "photo", None):
-            media_path = await msg.download_media(file="/tmp/")
-    except Exception:
-        log.exception("Media download failed; continuing with text only")
+        # Incorporate hidden entity URLs if any
+        for ent in sorted(msg.entities or [], key=lambda e: -e.offset):
+            url = getattr(ent, "url", None)
+            if url:
+                clean_ent = clean_url_formatting(url)
+                if _host_matches(urlparse(clean_ent).netloc):
+                    display_text = display_text[:ent.offset] + clean_ent + display_text[ent.offset + ent.length:]
 
-    try:
-        results = await asyncio.gather(
-            *(safe_post(bot, u, display_text, media_path) for u in users),
-            return_exceptions=True,
+        is_real_media = bool(
+            getattr(msg, "photo", None)
+            or getattr(msg, "video", None)
+            or getattr(msg, "document", None)
+            or (getattr(msg, "media", None) and not hasattr(msg.media, "webpage"))
         )
-        ok = sum(1 for r in results if r is True)
-        log.info("Post from %s fanned out: %d/%d delivered", getattr(chat, "username", chat.id), ok, len(users))
-    finally:
-        if media_path and os.path.exists(media_path):
+        has_text = bool(display_text.strip())
+
+        # If message has neither text nor media, skip
+        if not has_text and not is_real_media:
+            return
+
+        # Unshorten any shortened deal links beforehand in parallel
+        deal_urls = extract_deal_urls(display_text)
+        shortened = [u for u in deal_urls if is_shortened_url(u)]
+        if shortened:
+            await asyncio.gather(*(unshorten_url(u) for u in shortened), return_exceptions=True)
+
+        # Download media to disk for bot fallback if real media is present
+        media_path = None
+        if is_real_media:
             try:
-                os.remove(media_path)
-            except OSError:
-                pass
+                temp_dir = tempfile.gettempdir()
+                media_path = await msg.download_media(file=temp_dir)
+            except Exception as media_err:
+                log.warning("Media download failed (%s); continuing with native Telethon media or text", media_err)
+
+        try:
+            results = await asyncio.gather(
+                *(safe_post(bot, u, display_text, msg, media_path) for u in users),
+                return_exceptions=True,
+            )
+            ok = sum(1 for r in results if r is True)
+            log.info("Post from %s fanned out: %d/%d delivered", getattr(chat, "username", chat.id), ok, len(users))
+        finally:
+            if media_path and os.path.exists(media_path):
+                try:
+                    os.remove(media_path)
+                except OSError:
+                    pass
+    except Exception:
+        log.exception("Error in handle_new_post listener")
 
 
 # --------------------------------------------------------------------------- #
@@ -713,6 +923,7 @@ class LoginFSM(StatesGroup):
     waiting_for_phone = State()
     waiting_for_otp = State()
     waiting_for_2fa = State()
+    waiting_for_custom_channel = State()
 
 
 router = Router()
@@ -722,7 +933,7 @@ HELP_TEXT = (
     "Commands:\n"
     "• /start - Open main menu & dashboard\n"
     "• /login - Connect your personal Telegram account\n"
-    "• /mychannels - Select Source & Target channels\n"
+    "• /select_channels or /mychannels - Select Source & Target channels\n"
     "• /status - View your automation status & SubID\n"
     "• /cancel - Cancel any ongoing action\n\n"
     "Deals from your chosen source channels are automatically converted with your "
@@ -1265,12 +1476,14 @@ async def get_user_dialogs(tg_user_id: int) -> list[dict[str, Any]]:
 def build_channel_hub_kb(sources_count: int, targets_count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"📥 Source Channels ({sources_count})", callback_data="ch:src:0")],
+        [InlineKeyboardButton(text="➕ Add Custom Source Channel", callback_data="ch:add_custom")],
         [InlineKeyboardButton(text=f"📤 Target Channel(s) ({targets_count})", callback_data="ch:tgt:0")],
         [InlineKeyboardButton(text="💾 Save & Activate Channels", callback_data="ch:save")],
         [InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="menu:main")],
     ])
 
 
+@router.message(Command("select_channels"))
 @router.message(Command("mychannels"))
 @router.callback_query(F.data == "menu:channels")
 @router.callback_query(F.data == "ch:hub")
@@ -1287,13 +1500,15 @@ async def show_channel_hub(event: Message | CallbackQuery, state: FSMContext = N
         except Exception:
             pass
 
-    # Initialize draft selection if not present
+    # Initialize draft selection with NO presets active by default!
+    # Only load channels previously explicitly saved by the user.
     if tg_user_id not in _channel_drafts:
         initial_sources = set()
         initial_targets = set()
-        if u_cfg:
+        if u_cfg and u_cfg.source_channels:
             for s in u_cfg.source_channels:
                 initial_sources.add(norm_channel(s))
+        if u_cfg:
             if u_cfg.target_channel_id:
                 initial_targets.add(str(u_cfg.target_channel_id))
             for t in u_cfg.target_channels:
@@ -1311,7 +1526,7 @@ async def show_channel_hub(event: Message | CallbackQuery, state: FSMContext = N
         "📢 <b>Channel Management Hub</b>\n\n"
         f"📥 <b>Source Channels:</b> {len(draft['sources'])} selected (deals monitored)\n"
         f"📤 <b>Target Channels:</b> {len(draft['targets'])} selected (deals posted with your SubID)\n\n"
-        "Tap below to customize your channels, then click <b>Save & Activate</b>:"
+        "Tap below to choose dialogs or add custom channels, then click <b>Save & Activate</b>:"
     )
 
     kb = build_channel_hub_kb(len(draft["sources"]), len(draft["targets"]))
@@ -1320,6 +1535,51 @@ async def show_channel_hub(event: Message | CallbackQuery, state: FSMContext = N
         await event.answer()
     else:
         await event.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "ch:add_custom")
+async def prompt_custom_channel(query: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(LoginFSM.waiting_for_custom_channel)
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Channels Hub", callback_data="ch:hub")]])
+    await query.message.edit_text(
+        "➕ <b>Add Custom Source Channel</b>\n\n"
+        "Send the Telegram channel username or link you want to monitor deals from.\n\n"
+        "<b>Examples:</b>\n"
+        "• <code>@deals_channel</code>\n"
+        "• <code>https://t.me/deals_channel</code>\n"
+        "• Channel ID like <code>-1001234567890</code>\n\n"
+        "Type your channel username below or click Back:",
+        reply_markup=cancel_kb,
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+
+@router.message(LoginFSM.waiting_for_custom_channel)
+async def process_custom_channel(message: Message, state: FSMContext) -> None:
+    tg_user_id = message.from_user.id
+    input_text = (message.text or "").strip()
+    if not input_text:
+        await message.answer("❌ Please send a valid channel username or link, or /cancel.")
+        return
+
+    clean_key = norm_channel(input_text)
+    if not clean_key:
+        await message.answer("❌ Could not parse channel. Please enter like <code>@channelname</code>:")
+        return
+
+    draft = _channel_drafts.setdefault(tg_user_id, {"sources": set(), "targets": set()})
+    draft["sources"].add(clean_key)
+    await state.set_state(None)
+
+    kb = build_channel_hub_kb(len(draft["sources"]), len(draft["targets"]))
+    await message.answer(
+        f"✅ <b>Added source channel:</b> <code>{clean_key}</code>\n\n"
+        f"You now have {len(draft['sources'])} source channel(s) selected.\n\n"
+        "Tap <b>💾 Save & Activate Channels</b> to confirm and activate monitoring!",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data.startswith("ch:src:"))
@@ -1532,6 +1792,16 @@ async def save_channels_handler(query: CallbackQuery, state: FSMContext = None) 
         target_channel_name=primary_target_name,
         user_id=user_id,
     )
+
+    await api_save_user_config({
+        "userId": user_id,
+        "telegramUserId": str(tg_user_id),
+        "sourceChannels": source_objs,
+        "targetChannels": target_objs,
+        "targetChannelId": primary_target_id,
+        "targetChannelName": primary_target_name,
+        "isActive": True,
+    })
 
     asyncio.create_task(refresh_configs())
 
