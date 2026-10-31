@@ -104,8 +104,9 @@ _pending_logins: dict[int, dict[str, Any]] = {}
 _channel_drafts: dict[int, dict[str, set[str]]] = {}
 _dialogs_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
 
-# In-memory mapping of telegram_user_id -> verified user_id
+# In-memory mapping of telegram_user_id -> verified user_id & exact tracking_sub_id
 _telegram_to_user_id: dict[str, str] = {}
+_telegram_to_sub_id: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -336,6 +337,14 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             else:
                 primary_target = parse_target(first)
 
+        parsed_sub_id = str(
+            raw.get("trackingSubId")
+            or raw.get("subId")
+            or (raw.get("user") or {}).get("trackingSubId")
+            or (raw.get("user") or {}).get("subId")
+            or ""
+        )
+
         return UserConfig(
             user_id=str(raw["userId"]),
             telegram_user_id=str(raw.get("telegramUserId") or ""),
@@ -345,7 +354,7 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             target_channels=list(target_ch_list) if isinstance(target_ch_list, list) else [],
             source_channels=source_names,
             source_channels_raw=list(raw_sources) if isinstance(raw_sources, list) else [],
-            tracking_sub_id=str(raw.get("trackingSubId") or ""),
+            tracking_sub_id=parsed_sub_id,
             is_active=bool(raw.get("isActive", True)),
         )
     except Exception:
@@ -768,11 +777,30 @@ async def cmd_start(message: Message, command: CommandObject = None, state: FSMC
             await state.update_data(user_id=user_id)
 
         res = await api_verify_sync(user_id, tg_user.id, tg_user.username)
-        sub_id = res.get("trackingSubId") or (res.get("user") or {}).get("trackingSubId")
+        sub_id = (
+            res.get("trackingSubId")
+            or res.get("subId")
+            or (res.get("user") or {}).get("trackingSubId")
+            or (res.get("user") or {}).get("subId")
+            or (res.get("data") or {}).get("trackingSubId")
+            or (res.get("data") or {}).get("subId")
+            or ""
+        )
         if not sub_id:
             cfg_rows = await api_fetch_configs(user_id=user_id)
             if cfg_rows:
-                sub_id = cfg_rows[0].get("trackingSubId")
+                sub_id = (
+                    cfg_rows[0].get("trackingSubId")
+                    or cfg_rows[0].get("subId")
+                    or (cfg_rows[0].get("user") or {}).get("trackingSubId")
+                    or (cfg_rows[0].get("user") or {}).get("subId")
+                    or ""
+                )
+
+        if sub_id:
+            _telegram_to_sub_id[str(tg_user.id)] = sub_id
+            if state:
+                await state.update_data(tracking_sub_id=sub_id, sub_id=sub_id)
 
         status_code = res.get("_status")
         is_success = (status_code == 200 or res.get("success") is True or "successfully" in str(res.get("message") or "").lower())
@@ -875,8 +903,9 @@ async def cb_main_menu(query: CallbackQuery, state: FSMContext = None) -> None:
 @router.callback_query(F.data == "login:cancel")
 async def cancel_handler(event: Message | CallbackQuery, state: FSMContext) -> None:
     tg_user_id = event.from_user.id
-    # Preserve user_id when clearing state
+    # Preserve user_id and tracking_sub_id when clearing state
     user_id = (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+    sub_id = (await state.get_data()).get("tracking_sub_id") or (await state.get_data()).get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
     pending = _pending_logins.pop(tg_user_id, None)
     if pending:
         try:
@@ -884,9 +913,16 @@ async def cancel_handler(event: Message | CallbackQuery, state: FSMContext) -> N
         except Exception:
             pass
     await state.clear()
+    state_updates: dict[str, Any] = {}
     if user_id:
         _telegram_to_user_id[str(tg_user_id)] = user_id
-        await state.update_data(user_id=user_id)
+        state_updates["user_id"] = user_id
+    if sub_id:
+        _telegram_to_sub_id[str(tg_user_id)] = sub_id
+        state_updates["tracking_sub_id"] = sub_id
+        state_updates["sub_id"] = sub_id
+    if state_updates:
+        await state.update_data(**state_updates)
     msg = event.message if isinstance(event, CallbackQuery) else event
     await msg.answer("❌ Action cancelled. Tap /start to open the main menu.")
     if isinstance(event, CallbackQuery):
@@ -904,14 +940,19 @@ async def start_login(event: Message | CallbackQuery, state: FSMContext) -> None
     # Retrieve verified user_id from state, memory, store, or database API
     curr_data = await state.get_data()
     user_id = curr_data.get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+    sub_id = curr_data.get("tracking_sub_id") or curr_data.get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
     if not user_id:
         u_cfg = store.get_by_telegram_id(tg_user_id)
         if u_cfg and u_cfg.user_id:
             user_id = u_cfg.user_id
+            if u_cfg.tracking_sub_id and not sub_id:
+                sub_id = u_cfg.tracking_sub_id
     if not user_id:
         rows = await api_fetch_configs(telegram_id=tg_user_id)
         if rows and rows[0].get("userId"):
             user_id = rows[0]["userId"]
+            if rows[0].get("trackingSubId") and not sub_id:
+                sub_id = rows[0]["trackingSubId"]
 
     if not user_id:
         dashboard_url = f"{BASE_WEB_URL}/telegram-bot"
@@ -933,6 +974,8 @@ async def start_login(event: Message | CallbackQuery, state: FSMContext) -> None
         return
 
     _telegram_to_user_id[str(tg_user_id)] = user_id
+    if sub_id:
+        _telegram_to_sub_id[str(tg_user_id)] = sub_id
     pending = _pending_logins.pop(tg_user_id, None)
     if pending:
         try:
@@ -940,9 +983,13 @@ async def start_login(event: Message | CallbackQuery, state: FSMContext) -> None
         except Exception:
             pass
 
-    # Preserve user_id in state
+    # Preserve user_id and sub_id in state
     await state.set_state(LoginFSM.waiting_for_phone)
-    await state.update_data(user_id=user_id)
+    state_updates: dict[str, Any] = {"user_id": user_id}
+    if sub_id:
+        state_updates["tracking_sub_id"] = sub_id
+        state_updates["sub_id"] = sub_id
+    await state.update_data(**state_updates)
 
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
     text = (
@@ -980,14 +1027,24 @@ async def process_phone(message: Message, state: FSMContext) -> None:
     tg_user_id = message.from_user.id
     state_data = await state.get_data()
     user_id = state_data.get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+    sub_id = state_data.get("tracking_sub_id") or state_data.get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
 
     _pending_logins[tg_user_id] = {
         "client": client,
         "phone": phone,
         "phone_code_hash": req.phone_code_hash,
         "user_id": user_id,
+        "sub_id": sub_id,
     }
-    await state.update_data(phone=phone, phone_code_hash=req.phone_code_hash, user_id=user_id)
+    state_updates: dict[str, Any] = {
+        "phone": phone,
+        "phone_code_hash": req.phone_code_hash,
+        "user_id": user_id,
+    }
+    if sub_id:
+        state_updates["tracking_sub_id"] = sub_id
+        state_updates["sub_id"] = sub_id
+    await state.update_data(**state_updates)
     await state.set_state(LoginFSM.waiting_for_otp)
 
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
@@ -1015,6 +1072,7 @@ async def process_otp(message: Message, state: FSMContext) -> None:
     phone = pending["phone"]
     phone_code_hash = pending["phone_code_hash"]
     user_id = pending.get("user_id") or (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+    sub_id = pending.get("sub_id") or (await state.get_data()).get("tracking_sub_id") or (await state.get_data()).get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
 
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
@@ -1036,7 +1094,7 @@ async def process_otp(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ Login failed: {e}\n\nPlease try again or /cancel:")
         return
 
-    await finish_login(message, state, client, tg_user_id, user_id=user_id)
+    await finish_login(message, state, client, tg_user_id, user_id=user_id, sub_id=sub_id)
 
 
 @router.message(LoginFSM.waiting_for_2fa)
@@ -1051,6 +1109,7 @@ async def process_2fa(message: Message, state: FSMContext) -> None:
 
     client: TelegramClient = pending["client"]
     user_id = pending.get("user_id") or (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+    sub_id = pending.get("sub_id") or (await state.get_data()).get("tracking_sub_id") or (await state.get_data()).get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
 
     try:
         await client.sign_in(password=password)
@@ -1062,7 +1121,7 @@ async def process_2fa(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ 2FA error: {e}\n\nPlease re-enter password or /cancel:")
         return
 
-    await finish_login(message, state, client, tg_user_id, user_id=user_id)
+    await finish_login(message, state, client, tg_user_id, user_id=user_id, sub_id=sub_id)
 
 
 async def finish_login(
@@ -1070,14 +1129,17 @@ async def finish_login(
     state: FSMContext,
     client: TelegramClient,
     tg_user_id: int,
-    user_id: Optional[str] = None
+    user_id: Optional[str] = None,
+    sub_id: Optional[str] = None,
 ) -> None:
     session_str = client.session.save()
     tg_user = message.from_user
 
+    state_data = await state.get_data()
     if not user_id:
-        state_data = await state.get_data()
         user_id = state_data.get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
+    if not sub_id:
+        sub_id = state_data.get("tracking_sub_id") or state_data.get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
 
     log.info("Finishing login: telegram_user_id=%s, user_id=%s", tg_user_id, user_id)
 
@@ -1089,10 +1151,53 @@ async def finish_login(
         user_id=user_id,
     )
 
+    # Capture exact tracking SubID returned from Next.js web API
+    api_sub_id = (
+        res.get("trackingSubId")
+        or res.get("subId")
+        or (res.get("user") or {}).get("trackingSubId")
+        or (res.get("user") or {}).get("subId")
+        or (res.get("data") or {}).get("trackingSubId")
+        or (res.get("data") or {}).get("subId")
+        or (res.get("config") or {}).get("trackingSubId")
+        or (res.get("config") or {}).get("subId")
+        or sub_id
+        or ""
+    )
+
+    if not api_sub_id:
+        # Fallback to query user config from Next.js API if not included directly in save-session response
+        try:
+            cfg_rows = await api_fetch_configs(telegram_id=tg_user_id, user_id=user_id)
+            if cfg_rows:
+                api_sub_id = (
+                    cfg_rows[0].get("trackingSubId")
+                    or cfg_rows[0].get("subId")
+                    or (cfg_rows[0].get("user") or {}).get("trackingSubId")
+                    or (cfg_rows[0].get("user") or {}).get("subId")
+                    or ""
+                )
+        except Exception as e:
+            log.warning("Fetch configs after save_session failed: %s", e)
+
     await state.clear()
+    state_updates: dict[str, Any] = {}
     if user_id:
         _telegram_to_user_id[str(tg_user_id)] = user_id
-        await state.update_data(user_id=user_id)
+        state_updates["user_id"] = user_id
+    if api_sub_id:
+        _telegram_to_sub_id[str(tg_user_id)] = api_sub_id
+        state_updates["tracking_sub_id"] = api_sub_id
+        state_updates["sub_id"] = api_sub_id
+        if user_id and user_id in store.users:
+            store.users[user_id].tracking_sub_id = api_sub_id
+        cfg = store.get_by_telegram_id(tg_user_id)
+        if cfg:
+            cfg.tracking_sub_id = api_sub_id
+
+    if state_updates:
+        await state.update_data(**state_updates)
+
     _pending_logins.pop(tg_user_id, None)
 
     # Register live client
@@ -1105,17 +1210,10 @@ async def finish_login(
     ])
 
     user_info = f" (User ID: <code>{user_id}</code>)" if user_id else ""
+    sub_info = f"\n🔗 <b>Your Tracking SubID:</b> <code>{api_sub_id}</code>\n" if api_sub_id else ""
     await message.answer(
         f"✅ <b>Account Linked Successfully!</b>{user_info}\n\n"
-        "Your Telegram account is now connected and authorized.\n\n"
-        "👉 Next step: tap <b>[📢 Select Channels]</b> to choose your source & target channels.",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-
-    await message.answer(
-        "✅ <b>Account Linked Successfully!</b>\n\n"
-        "Your Telegram account is now connected and authorized.\n\n"
+        f"Your Telegram account is now connected and authorized.{sub_info}\n"
         "👉 Next step: tap <b>[📢 Select Channels]</b> to choose your source & target channels.",
         reply_markup=kb,
         parse_mode="HTML",
@@ -1471,20 +1569,35 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
     if tg_user is None:
         return
 
+    state_data = await state.get_data() if state else {}
+    exact_sub_id = (
+        state_data.get("tracking_sub_id")
+        or state_data.get("sub_id")
+        or _telegram_to_sub_id.get(str(tg_user.id))
+    )
+
     # Check local store or fetch fresh
     c = store.get_by_telegram_id(tg_user.id)
-    if not c:
+    if not c or not (c.tracking_sub_id or exact_sub_id):
         uid = _telegram_to_user_id.get(str(tg_user.id))
         if not uid and state:
-            uid = (await state.get_data()).get("user_id")
+            uid = state_data.get("user_id")
         rows = await api_fetch_configs(telegram_id=tg_user.id, user_id=uid)
         parsed = [p for p in (parse_config(r) for r in rows) if p]
         if parsed:
             c = parsed[0]
             if c.user_id:
                 _telegram_to_user_id[str(tg_user.id)] = c.user_id
+            if c.tracking_sub_id:
+                _telegram_to_sub_id[str(tg_user.id)] = c.tracking_sub_id
 
-    if not c:
+    final_sub_id = (
+        exact_sub_id
+        or (c.tracking_sub_id if c and c.tracking_sub_id else None)
+        or _telegram_to_sub_id.get(str(tg_user.id))
+    )
+
+    if not c and not final_sub_id:
         text = (
             "ℹ️ <b>No Linked Account Found</b>\n\n"
             "Please open your website dashboard and click <b>Connect Telegram</b> to link your account, "
@@ -1496,19 +1609,23 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
             [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu:main")],
         ])
     else:
-        target = c.target_channel_name or c.target_channel_id or "Not set"
-        session_status = "🟢 Connected" if c.session_string else "🟡 Using Bot / Not Connected"
-        sub_id = c.tracking_sub_id or "Not configured"
+        target = (c.target_channel_name or c.target_channel_id) if c else "Not set"
+        session_status = "🟢 Connected" if (c and c.session_string) else "🟡 Using Bot / Not Connected"
+        sub_id_str = final_sub_id or "Not configured"
+        user_id_str = (c.user_id if c else None) or _telegram_to_user_id.get(str(tg_user.id)) or state_data.get("user_id") or "Connected"
+        is_active = c.is_active if c else True
+        source_channels = c.source_channels if c else []
+
         text = (
             "⚙️ <b>Automation Status</b>\n\n"
-            f"• <b>User ID:</b> <code>{c.user_id}</code>\n"
-            f"• <b>Status:</b> {'🟢 Active' if c.is_active else '🔴 Inactive'}\n"
-            f"• <b>SubID:</b> <code>{sub_id}</code>\n"
+            f"• <b>User ID:</b> <code>{user_id_str}</code>\n"
+            f"• <b>Status:</b> {'🟢 Active' if is_active else '🔴 Inactive'}\n"
+            f"• <b>SubID:</b> <code>{sub_id_str}</code>\n"
             f"• <b>Telegram Account:</b> {session_status}\n"
             f"• <b>Target Channel:</b> <code>{target}</code>\n"
-            f"• <b>Source Channels:</b> {len(c.source_channels)}\n"
-            + ("\n".join(f"  ▫️ {x}" for x in c.source_channels[:8]))
-            + ("\n  <i>...and more</i>" if len(c.source_channels) > 8 else "")
+            f"• <b>Source Channels:</b> {len(source_channels)}\n"
+            + (("\n".join(f"  ▫️ {x}" for x in source_channels[:8])) if source_channels else "  ▫️ None selected")
+            + ("\n  <i>...and more</i>" if len(source_channels) > 8 else "")
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📢 Select Channels", callback_data="menu:channels")],
@@ -1545,6 +1662,8 @@ async def refresh_configs() -> None:
             users[cfg.user_id] = cfg
             if cfg.telegram_user_id:
                 _telegram_to_user_id[str(cfg.telegram_user_id)] = cfg.user_id
+                if cfg.tracking_sub_id:
+                    _telegram_to_sub_id[str(cfg.telegram_user_id)] = cfg.tracking_sub_id
     store.replace(users)
     log.info("Config synced: %d active users, %d distinct sources", len(users), len(store.all_sources()))
     await session_mgr.sync_user_sessions(users)
