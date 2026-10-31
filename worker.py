@@ -571,55 +571,71 @@ def to_cuelinks(url: str, sub_id: str) -> str:
 
 
 async def api_shorten_link(original_url: str, user_id: Optional[str] = None) -> Optional[str]:
-    """Call web shortener API: POST ${BASE_WEB_URL}/api/links/shorten
+    """Call web shortener API: POST https://kamaikaro.in/api/links/shorten (or ${BASE_WEB_URL}/api/links/shorten)
     Request body: { "originalUrl": converted_cuelinks_url, "userId": user_id }
-    Strict 3-second non-blocking timeout. Falls back cleanly to None on 404, 500, timeout, or error.
+    Uses 7-second timeout.
+    Returns branded short link (e.g. https://kamaikaro.in/{slug}) or None on complete failure/non-200.
     """
     clean_orig = clean_url_formatting(original_url)
     if not clean_orig:
         return None
 
-    endpoint = f"{BASE_WEB_URL}/api/links/shorten"
+    # Candidate endpoints: prefer primary branded domain, fallback to BASE_WEB_URL
+    endpoints = ["https://kamaikaro.in/api/links/shorten"]
+    base_endpoint = f"{BASE_WEB_URL}/api/links/shorten"
+    if base_endpoint not in endpoints:
+        endpoints.append(base_endpoint)
+
     payload: dict[str, Any] = {"originalUrl": clean_orig}
     if user_id:
         payload["userId"] = str(user_id)
 
     async def _request_shorten() -> Optional[str]:
         s = await http()
-        timeout = aiohttp.ClientTimeout(total=2.8, connect=1.2, sock_read=1.8)
-        async with s.post(endpoint, json=payload, timeout=timeout) as resp:
-            if resp.status in (200, 201):
-                try:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, dict):
-                        short_url = (
-                            data.get("shortUrl")
-                            or data.get("shortenedUrl")
-                            or data.get("url")
-                            or (data.get("link") or {}).get("shortUrl")
-                            or (data.get("link") or {}).get("url")
-                            or (data.get("data") or {}).get("shortUrl")
-                            or (data.get("data") or {}).get("url")
-                        )
-                        if not short_url and data.get("slug"):
-                            short_url = f"https://kamaikaro.in/{data['slug']}"
-                        elif not short_url and (data.get("link") or {}).get("slug"):
-                            short_url = f"https://kamaikaro.in/{data['link']['slug']}"
+        timeout = aiohttp.ClientTimeout(total=6.5, connect=2.5, sock_read=4.0)
 
-                        if short_url and isinstance(short_url, str) and short_url.startswith("http"):
-                            return clean_url_formatting(short_url)
-                except Exception as json_err:
-                    log.warning("JSON parse error in api_shorten_link: %s; fallback to direct Cuelinks", json_err)
-            else:
-                log.warning("api_shorten_link HTTP %d: %s; fallback to direct Cuelinks", resp.status, await resp.text())
+        for endpoint in endpoints:
+            try:
+                async with s.post(endpoint, json=payload, timeout=timeout) as resp:
+                    if resp.status in (200, 201):
+                        data = await resp.json(content_type=None)
+                        if isinstance(data, dict):
+                            short_url = (
+                                data.get("shortUrl")
+                                or data.get("shortenedUrl")
+                                or data.get("url")
+                                or (data.get("link") or {}).get("shortUrl")
+                                or (data.get("link") or {}).get("url")
+                                or (data.get("data") or {}).get("shortUrl")
+                                or (data.get("data") or {}).get("url")
+                            )
+                            if not short_url and data.get("slug"):
+                                short_url = f"https://kamaikaro.in/{data['slug']}"
+                            elif not short_url and (data.get("link") or {}).get("slug"):
+                                short_url = f"https://kamaikaro.in/{data['link']['slug']}"
+
+                            if short_url and isinstance(short_url, str):
+                                clean_short = clean_url_formatting(short_url)
+                                if clean_short.startswith("http"):
+                                    return clean_short
+                                elif clean_short.startswith("/"):
+                                    return clean_url_formatting(f"https://kamaikaro.in{clean_short}")
+                                else:
+                                    return clean_url_formatting(f"https://kamaikaro.in/{clean_short}")
+                    else:
+                        resp_text = await resp.text()
+                        log.warning("api_shorten_link (%s) HTTP %d: %s", endpoint, resp.status, resp_text[:120])
+            except Exception as ep_err:
+                log.warning("api_shorten_link (%s) error: %s", endpoint, ep_err)
+
         return None
 
     try:
-        return await asyncio.wait_for(_request_shorten(), timeout=3.0)
+        return await asyncio.wait_for(_request_shorten(), timeout=7.0)
     except asyncio.TimeoutError:
-        log.warning("api_shorten_link timed out (>3s) for %s; fallback to direct Cuelinks", clean_orig[:60])
+        log.warning("api_shorten_link timed out (>7s) for %s; falling back to direct Cuelinks", clean_orig[:60])
     except Exception as e:
-        log.warning("api_shorten_link failed for %s (%s); fallback to direct Cuelinks", clean_orig[:60], e)
+        log.warning("api_shorten_link failed for %s (%s); falling back to direct Cuelinks", clean_orig[:60], e)
 
     return None
 
@@ -654,23 +670,28 @@ async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) ->
             if dest_host and not any(dest_host == d or dest_host.endswith("." + d) for d in EXCLUDED_DOMAINS):
                 cuelink = clean_url_formatting(to_cuelinks(clean_url, sub_id))
 
-                # Attempt custom Kamaikaro link shortening (strict 3-sec non-blocking timeout)
+                # Attempt custom Kamaikaro link shortening (7-second timeout)
                 short_url = None
-                if user_id:
-                    try:
-                        short_url = await api_shorten_link(cuelink, user_id=user_id)
-                    except Exception as short_err:
-                        log.warning("api_shorten_link error in convert_text: %s; falling back to Cuelinks link", short_err)
-                        short_url = None
+                try:
+                    short_url = await api_shorten_link(cuelink, user_id=user_id)
+                except Exception as short_err:
+                    log.warning("api_shorten_link error in convert_text: %s; falling back to Cuelinks link", short_err)
+                    short_url = None
 
-                # Clean single-line Cuelinks URL fallback if shortener returned None or failed
+                # Branded short link if generated, else fallback cleanly to Cuelinks URL
                 final_link = clean_url_formatting(short_url) if short_url else cuelink
                 text = text.replace(u, final_link)
                 converted_count += 1
                 log.info("Converted deal link: %s -> %s", u, final_link)
             else:
-                # Still replace with guaranteed base cuelink if valid deal target
-                text = text.replace(u, base_cuelink)
+                # Still try shortening the base cuelink
+                short_url = None
+                try:
+                    short_url = await api_shorten_link(base_cuelink, user_id=user_id)
+                except Exception:
+                    pass
+                final_link = clean_url_formatting(short_url) if short_url else base_cuelink
+                text = text.replace(u, final_link)
                 converted_count += 1
         except Exception as e:
             log.warning("Error in convert_text for URL %s: %s; applying direct Cuelinks fallback", u, e)
@@ -890,10 +911,11 @@ def chat_keys(chat: Any) -> set[str]:
 async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> None:
     # 1. Strictly resolve active user's SubID from memory/state or database
     sub_id = await resolve_user_sub_id(user)
+    uid = user.user_id or _telegram_to_user_id.get(str(user.telegram_user_id)) or ""
 
     # 2. Convert deal links using Cuelinks and Kamaikaro link shortener
     if sub_id:
-        converted, n = await convert_text(text, sub_id, user_id=user.user_id)
+        converted, n = await convert_text(text, sub_id, user_id=uid)
     else:
         converted = text
         n = 0
