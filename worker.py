@@ -123,9 +123,10 @@ _pending_logins: dict[int, dict[str, Any]] = {}
 _channel_drafts: dict[int, dict[str, set[str]]] = {}
 _dialogs_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
 
-# In-memory mapping of telegram_user_id -> verified user_id & exact tracking_sub_id
+# In-memory mapping of telegram_user_id -> verified user_id & exact tracking_sub_id & amazon_tag
 _telegram_to_user_id: dict[str, str] = {}
 _telegram_to_sub_id: dict[str, str] = {}
+_telegram_to_amazon_tag: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -142,6 +143,7 @@ class UserConfig:
     source_channels: list[str] = field(default_factory=list)
     source_channels_raw: list[Any] = field(default_factory=list)
     tracking_sub_id: str = ""
+    amazon_tag: str = ""
     is_active: bool = True
 
 
@@ -398,6 +400,14 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             or ""
         )
 
+        parsed_amazon_tag = str(
+            raw.get("amazonTag")
+            or raw.get("amazon_tag")
+            or (raw.get("user") or {}).get("amazonTag")
+            or (raw.get("user") or {}).get("amazon_tag")
+            or ""
+        ).strip()
+
         return UserConfig(
             user_id=str(raw["userId"]),
             telegram_user_id=str(raw.get("telegramUserId") or ""),
@@ -408,6 +418,7 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             source_channels=source_names,
             source_channels_raw=list(raw_sources) if isinstance(raw_sources, list) else [],
             tracking_sub_id=parsed_sub_id,
+            amazon_tag=parsed_amazon_tag,
             is_active=bool(raw.get("isActive", True)),
         )
     except Exception:
@@ -570,6 +581,28 @@ def to_cuelinks(url: str, sub_id: str) -> str:
     return clean_url_formatting(raw_cuelink)
 
 
+def is_amazon_url(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+        amazon_hosts = (
+            "amazon.in", "amazon.com", "amazn.lt", "amzn.to", "amzn.in",
+            "a.co", "amzn.cl", "amzn.eu", "amazon.co.uk", "amazon.de"
+        )
+        return any(host == d or host.endswith("." + d) for d in amazon_hosts)
+    except Exception:
+        return False
+
+
+def to_amazon_affiliate_url(url: str, amazon_tag: str) -> str:
+    """Strip old affiliate params and attach user's direct Amazon Associate Tag."""
+    clean = strip_affiliate_params(clean_url_formatting(url))
+    p = urlparse(clean)
+    q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+         if k.lower() not in ("tag", "tag_id", "ascsubtag", "linkcode")]
+    q.append(("tag", amazon_tag.strip()))
+    return clean_url_formatting(urlunparse(p._replace(query=urlencode(q))))
+
+
 async def api_shorten_link(original_url: str, user_id: Optional[str] = None) -> Optional[str]:
     """Call web shortener API: POST https://kamaikaro.in/api/links/shorten (or ${BASE_WEB_URL}/api/links/shorten)
     Request body: { "originalUrl": converted_cuelinks_url, "userId": user_id }
@@ -640,7 +673,12 @@ async def api_shorten_link(original_url: str, user_id: Optional[str] = None) -> 
     return None
 
 
-async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) -> tuple[str, int]:
+async def convert_text(
+    text: str,
+    sub_id: str,
+    user_id: Optional[str] = None,
+    amazon_tag: Optional[str] = None,
+) -> tuple[str, int]:
     if not text:
         return text, 0
 
@@ -652,8 +690,8 @@ async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) ->
     # Process longest URLs first to avoid partial replacements
     for u in sorted(urls, key=len, reverse=True):
         try:
-            # Guarantee a working Cuelinks URL beforehand
-            base_cuelink = clean_url_formatting(to_cuelinks(u, sub_id))
+            # Guarantee a base working fallback URL beforehand
+            base_cuelink = clean_url_formatting(to_cuelinks(u, sub_id)) if sub_id else u
 
             # Unshorten redirect URLs with 4-second timeout protection
             target_url = u
@@ -667,7 +705,32 @@ async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) ->
             clean_url = strip_affiliate_params(target_url)
             dest_host = urlparse(clean_url).netloc.lower().split(":")[0]
 
-            if dest_host and not any(dest_host == d or dest_host.endswith("." + d) for d in EXCLUDED_DOMAINS):
+            is_amz = is_amazon_url(target_url) or is_amazon_url(u)
+
+            # --------------------------------------------------------------- #
+            # Smart Deal Conversion Logic:
+            # 1. Amazon deals with user Amazon Associate Tag -> Route Directly!
+            # 2. Other deals (Flipkart, Myntra, Ajio, or no Amazon tag) -> Cuelinks
+            # --------------------------------------------------------------- #
+            if is_amz and amazon_tag:
+                direct_amz = to_amazon_affiliate_url(target_url, amazon_tag)
+
+                # Attempt custom Kamaikaro link shortening (7-second timeout)
+                short_url = None
+                try:
+                    short_url = await api_shorten_link(direct_amz, user_id=user_id)
+                except Exception as short_err:
+                    log.warning("api_shorten_link error for direct Amazon deal: %s; falling back to clean Amazon URL", short_err)
+                    short_url = None
+
+                # Branded short link if generated, else clean direct Amazon affiliate URL
+                final_link = clean_url_formatting(short_url) if short_url else direct_amz
+                text = text.replace(u, final_link)
+                converted_count += 1
+                log.info("Converted Amazon deal via direct Associate Tag (%s): %s -> %s", amazon_tag, u, final_link)
+
+            elif sub_id and dest_host and not any(dest_host == d or dest_host.endswith("." + d) for d in EXCLUDED_DOMAINS):
+                # Standard Cuelinks Conversion
                 cuelink = clean_url_formatting(to_cuelinks(clean_url, sub_id))
 
                 # Attempt custom Kamaikaro link shortening (7-second timeout)
@@ -682,21 +745,34 @@ async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) ->
                 final_link = clean_url_formatting(short_url) if short_url else cuelink
                 text = text.replace(u, final_link)
                 converted_count += 1
-                log.info("Converted deal link: %s -> %s", u, final_link)
+                log.info("Converted deal link via Cuelinks: %s -> %s", u, final_link)
+
             else:
-                # Still try shortening the base cuelink
+                # Other generic deal targets
+                if is_amz and amazon_tag:
+                    fallback_url = to_amazon_affiliate_url(target_url, amazon_tag)
+                elif sub_id:
+                    fallback_url = clean_url_formatting(to_cuelinks(u, sub_id))
+                else:
+                    fallback_url = clean_url
+
                 short_url = None
                 try:
-                    short_url = await api_shorten_link(base_cuelink, user_id=user_id)
+                    short_url = await api_shorten_link(fallback_url, user_id=user_id)
                 except Exception:
                     pass
-                final_link = clean_url_formatting(short_url) if short_url else base_cuelink
+                final_link = clean_url_formatting(short_url) if short_url else fallback_url
                 text = text.replace(u, final_link)
                 converted_count += 1
         except Exception as e:
-            log.warning("Error in convert_text for URL %s: %s; applying direct Cuelinks fallback", u, e)
+            log.warning("Error in convert_text for URL %s: %s; applying direct fallback", u, e)
             try:
-                fallback_link = clean_url_formatting(to_cuelinks(u, sub_id))
+                if is_amazon_url(u) and amazon_tag:
+                    fallback_link = to_amazon_affiliate_url(u, amazon_tag)
+                elif sub_id:
+                    fallback_link = clean_url_formatting(to_cuelinks(u, sub_id))
+                else:
+                    fallback_link = u
                 text = text.replace(u, fallback_link)
                 converted_count += 1
             except Exception:
@@ -746,6 +822,48 @@ async def resolve_user_sub_id(user: UserConfig) -> str:
             log.warning("Dynamic sub_id fetch by telegramId %s failed: %s", user.telegram_user_id, e)
 
     return sub_id or ""
+
+
+async def resolve_user_amazon_tag(user: UserConfig) -> str:
+    """Strictly resolve user's Amazon Associate Tag from memory/state or database."""
+    tag = user.amazon_tag or _telegram_to_amazon_tag.get(str(user.telegram_user_id)) or ""
+
+    if not tag and user.user_id:
+        try:
+            configs = await api_fetch_configs(user_id=user.user_id)
+            if configs:
+                tag = str(
+                    configs[0].get("amazonTag")
+                    or configs[0].get("amazon_tag")
+                    or (configs[0].get("user") or {}).get("amazonTag")
+                    or (configs[0].get("user") or {}).get("amazon_tag")
+                    or ""
+                ).strip()
+                if tag:
+                    user.amazon_tag = tag
+                    if user.telegram_user_id:
+                        _telegram_to_amazon_tag[str(user.telegram_user_id)] = tag
+        except Exception as e:
+            log.warning("Dynamic amazon_tag fetch by userId %s failed: %s", user.user_id, e)
+
+    if not tag and user.telegram_user_id:
+        try:
+            configs = await api_fetch_configs(telegram_id=user.telegram_user_id)
+            if configs:
+                tag = str(
+                    configs[0].get("amazonTag")
+                    or configs[0].get("amazon_tag")
+                    or (configs[0].get("user") or {}).get("amazonTag")
+                    or (configs[0].get("user") or {}).get("amazon_tag")
+                    or ""
+                ).strip()
+                if tag:
+                    user.amazon_tag = tag
+                    _telegram_to_amazon_tag[str(user.telegram_user_id)] = tag
+        except Exception as e:
+            log.warning("Dynamic amazon_tag fetch by telegramId %s failed: %s", user.telegram_user_id, e)
+
+    return tag or ""
 
 
 # --------------------------------------------------------------------------- #
@@ -909,13 +1027,14 @@ def chat_keys(chat: Any) -> set[str]:
 
 
 async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> None:
-    # 1. Strictly resolve active user's SubID from memory/state or database
+    # 1. Strictly resolve active user's SubID and Amazon Associate Tag from memory/state or database
     sub_id = await resolve_user_sub_id(user)
+    amazon_tag = await resolve_user_amazon_tag(user)
     uid = user.user_id or _telegram_to_user_id.get(str(user.telegram_user_id)) or ""
 
-    # 2. Convert deal links using Cuelinks and Kamaikaro link shortener
-    if sub_id:
-        converted, n = await convert_text(text, sub_id, user_id=uid)
+    # 2. Convert deal links using Amazon Direct Tag or Cuelinks and Kamaikaro link shortener
+    if sub_id or amazon_tag:
+        converted, n = await convert_text(text, sub_id=sub_id, user_id=uid, amazon_tag=amazon_tag)
     else:
         converted = text
         n = 0
@@ -2076,6 +2195,7 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
         target = (c.target_channel_name or c.target_channel_id) if c else "Not set"
         session_status = "🟢 Connected" if (c and c.session_string) else "🟡 Using Bot / Not Connected"
         sub_id_str = final_sub_id or "Not configured"
+        amazon_tag_str = (c.amazon_tag if c and c.amazon_tag else None) or _telegram_to_amazon_tag.get(str(tg_user.id)) or "None (Cuelinks routed)"
         user_id_str = (c.user_id if c else None) or _telegram_to_user_id.get(str(tg_user.id)) or state_data.get("user_id") or "Connected"
         is_active = c.is_active if c else True
         source_channels = c.source_channels if c else []
@@ -2085,6 +2205,7 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
             f"• <b>User ID:</b> <code>{user_id_str}</code>\n"
             f"• <b>Status:</b> {'🟢 Active' if is_active else '🔴 Inactive'}\n"
             f"• <b>SubID:</b> <code>{sub_id_str}</code>\n"
+            f"• <b>Amazon Tag:</b> <code>{amazon_tag_str}</code>\n"
             f"• <b>Telegram Account:</b> {session_status}\n"
             f"• <b>Target Channel:</b> <code>{target}</code>\n"
             f"• <b>Source Channels:</b> {len(source_channels)}\n"
@@ -2136,6 +2257,8 @@ async def refresh_configs() -> None:
                 _telegram_to_user_id[str(cfg.telegram_user_id)] = cfg.user_id
                 if cfg.tracking_sub_id:
                     _telegram_to_sub_id[str(cfg.telegram_user_id)] = cfg.tracking_sub_id
+                if cfg.amazon_tag:
+                    _telegram_to_amazon_tag[str(cfg.telegram_user_id)] = cfg.amazon_tag
 
     if users:
         store.replace(users)
