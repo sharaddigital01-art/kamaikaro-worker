@@ -75,20 +75,38 @@ SAVE_SESSION_URL = f"{BASE_WEB_URL}/api/telegram/save-session"
 CHANNELS_URL = f"{BASE_WEB_URL}/api/telegram/channels"
 
 SHORTENER_DOMAINS = (
-    "amzn.to", "amzn.in", "a.co",
-    "fkrt.it", "fkrt.cc", "dl.flipkart.com",
+    "amazn.lt", "amzn.to", "amzn.in", "amzn.cl", "amzn.eu", "a.co",
+    "fkrt.it", "fkrt.co", "fkrt.cc", "fkt.in", "dl.flipkart.com",
     "myntr.it", "ajio.page.link", "ajiio.in",
-    "bit.ly", "tinyurl.com", "cutt.ly", "t.co", "rb.gy", "shorturl.at",
+    "bit.ly", "bitly.com", "tinyurl.com", "cutt.ly", "t.co", "rb.gy",
+    "shorturl.at", "shorturl.ac", "is.gd", "t.ly", "v.gd", "buff.ly",
+    "ow.ly", "clk.im", "trib.al", "ift.tt", "goo.gl", "cleanuri.com",
+    "snip.ly", "rebrand.ly", "bl.ink", "dub.co", "short.io",
+)
+
+STORE_DOMAINS = (
+    "amazon.in", "amazon.com", "flipkart.com", "myntra.com", "ajio.com",
+    "meesho.com", "tatacliq.com", "nykaa.com", "jiomart.com", "shopsy.in",
+    "boat-lifestyle.com", "gonoise.com", "snapdeal.com", "croma.com",
+    "reliancedigital.in", "firstcry.com", "pepperfry.com", "swiggy.com",
+    "zomato.com", "zeptonow.com", "blinkit.com",
+)
+
+EXCLUDED_DOMAINS = (
+    "t.me", "telegram.me", "telegram.dog",
+    "kamaikaro.in", "kamaikaro.com",
+    "linksredirect.com", "cuelinks.com",
 )
 
 SUPPORTED_DOMAINS = {
-    "amazon": ("amazon.in", "amazon.com", "amzn.to", "amzn.in", "a.co"),
-    "flipkart": ("flipkart.com", "fkrt.it", "fkrt.cc", "dl.flipkart.com"),
+    "amazon": ("amazon.in", "amazon.com", "amazn.lt", "amzn.to", "amzn.in", "a.co", "amzn.cl", "amzn.eu"),
+    "flipkart": ("flipkart.com", "fkrt.it", "fkrt.co", "fkrt.cc", "fkt.in", "dl.flipkart.com"),
     "myntra": ("myntra.com", "myntr.it"),
     "ajio": ("ajio.com", "ajiio.in", "ajio.page.link"),
+    "stores": STORE_DOMAINS,
     "shorteners": SHORTENER_DOMAINS,
 }
-ALL_DOMAINS = tuple(d for ds in SUPPORTED_DOMAINS.values() for d in ds)
+ALL_DOMAINS = tuple(set(d for ds in SUPPORTED_DOMAINS.values() for d in ds))
 URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 TRAILING_PUNCT = ".,;:!?)]}>'\""
 
@@ -388,18 +406,40 @@ def _host_matches(host: str) -> bool:
 
 def is_shortened_url(url: str) -> bool:
     try:
-        host = urlparse(url).netloc.lower().split(":")[0]
-        return any(host == d or host.endswith("." + d) for d in SHORTENER_DOMAINS)
+        p = urlparse(url)
+        host = p.netloc.lower().split(":")[0]
+        if not host or any(host == d or host.endswith("." + d) for d in EXCLUDED_DOMAINS):
+            return False
+        # Known shortener domains (amazn.lt, amzn.to, fkrt.it, bit.ly, etc.)
+        if any(host == d or host.endswith("." + d) for d in SHORTENER_DOMAINS):
+            return True
+        # Generic short link heuristic: short hostname (<=15 chars) with single path segment
+        path = p.path.strip("/")
+        if len(host) <= 15 and ("/" not in path) and (2 <= len(path) <= 20):
+            return True
+        return False
     except Exception:
         return False
 
 
 def is_supported_product_host(host: str) -> bool:
     host = host.lower().split(":")[0]
-    product_domains = tuple(
-        d for k, ds in SUPPORTED_DOMAINS.items() if k != "shorteners" for d in ds
-    )
-    return any(host == d or host.endswith("." + d) for d in product_domains)
+    return any(host == d or host.endswith("." + d) for d in STORE_DOMAINS)
+
+
+def is_deal_target_candidate(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower().split(":")[0]
+        if not host or any(host == d or host.endswith("." + d) for d in EXCLUDED_DOMAINS):
+            return False
+        # Known shortener or store domain
+        if any(host == d or host.endswith("." + d) for d in ALL_DOMAINS):
+            return True
+        # Generic HTTP/HTTPS URL
+        return True
+    except Exception:
+        return False
 
 
 def extract_deal_urls(text: str) -> list[str]:
@@ -407,10 +447,12 @@ def extract_deal_urls(text: str) -> list[str]:
     for m in URL_RE.finditer(text or ""):
         url = m.group(0).rstrip(TRAILING_PUNCT)
         try:
-            host = urlparse(url).netloc
-        except ValueError:
+            host = urlparse(url).netloc.lower().split(":")[0]
+        except Exception:
             continue
-        if _host_matches(host) and url not in seen:
+        if not host or any(host == d or host.endswith("." + d) for d in EXCLUDED_DOMAINS):
+            continue
+        if is_deal_target_candidate(url) and url not in seen:
             seen.add(url)
             out.append(url)
     return out
@@ -424,11 +466,12 @@ def strip_affiliate_params(url: str) -> str:
             "tag", "affid", "aff_id", "affextparam1", "affextparam2",
             "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
             "subid", "cid", "ref", "ref_", "linkcode", "linkid", "ascsubtag",
-            "creative", "camp", "creativeasin",
+            "creative", "camp", "creativeasin", "tag_id", "source", "share_tag",
         }
         q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-             if k.lower() not in drop and not k.lower().startswith("utm_")]
-        return urlunparse(p._replace(query=urlencode(q)))
+             if k.lower() not in drop and not k.lower().startswith("utm_") and not k.lower().startswith("aff_")]
+        clean_path = re.sub(r"/ref=[^/?#]+", "", p.path)
+        return urlunparse(p._replace(path=clean_path, query=urlencode(q)))
     except Exception:
         return url
 
@@ -437,27 +480,73 @@ _RESOLVED_CACHE: dict[str, str] = {}
 
 
 async def unshorten_url(url: str) -> str:
+    url = clean_url_formatting(url)
+    if not url:
+        return ""
     if url in _RESOLVED_CACHE:
         return _RESOLVED_CACHE[url]
     if not is_shortened_url(url):
         return url
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     resolved = url
+
+    # Method 1: aiohttp with allow_redirects=True (HEAD first, then GET)
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=8, connect=4)
         async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                final_url = str(resp.url)
-                if final_url and final_url.startswith("http"):
-                    resolved = final_url
+            try:
+                async with session.head(url, allow_redirects=True) as resp:
+                    final_url = str(resp.url)
+                    if final_url and final_url.startswith("http") and final_url != url:
+                        resolved = final_url
+            except Exception:
+                pass
+
+            if resolved == url:
+                async with session.get(url, allow_redirects=True) as resp:
+                    final_url = str(resp.url)
+                    if final_url and final_url.startswith("http") and final_url != url:
+                        resolved = final_url
+                    elif "location" in resp.headers:
+                        loc = resp.headers["location"]
+                        if loc.startswith("http"):
+                            resolved = loc
     except Exception as e:
-        log.warning("Could not unshorten %s: %s", url, e)
-        resolved = url
+        log.warning("aiohttp unshorten error for %s: %s", url, e)
+
+    # Method 2: Synchronous requests in thread executor fallback
+    if resolved == url:
+        def _sync_expand(u: str) -> str:
+            try:
+                import requests
+                # Try HEAD
+                try:
+                    r = requests.head(u, allow_redirects=True, timeout=5, headers=headers, verify=False)
+                    if r.url and r.url.startswith("http") and r.url != u:
+                        return r.url
+                except Exception:
+                    pass
+                # Try GET
+                r = requests.get(u, allow_redirects=True, timeout=5, headers=headers, verify=False)
+                if r.url and r.url.startswith("http") and r.url != u:
+                    return r.url
+            except Exception:
+                pass
+            return u
+
+        try:
+            loop = asyncio.get_running_loop()
+            sync_res = await loop.run_in_executor(None, _sync_expand, url)
+            if sync_res and sync_res.startswith("http") and sync_res != url:
+                resolved = sync_res
+        except Exception as e:
+            log.warning("Sync unshorten fallback error for %s: %s", url, e)
 
     _RESOLVED_CACHE[url] = resolved
     if len(_RESOLVED_CACHE) > 5000:
@@ -553,8 +642,8 @@ async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) ->
             target_url = await unshorten_url(u) if is_shortened_url(u) else u
             clean_url = strip_affiliate_params(target_url)
 
-            netloc = urlparse(clean_url).netloc
-            if is_supported_product_host(netloc) or not is_shortened_url(clean_url):
+            dest_host = urlparse(clean_url).netloc.lower().split(":")[0]
+            if dest_host and not any(dest_host == d or dest_host.endswith("." + d) for d in EXCLUDED_DOMAINS):
                 cuelink = to_cuelinks(clean_url, sub_id)
 
                 # Attempt custom Kamaikaro link shortening
@@ -565,6 +654,7 @@ async def convert_text(text: str, sub_id: str, user_id: Optional[str] = None) ->
                 final_link = clean_url_formatting(short_url) if short_url else clean_url_formatting(cuelink)
                 text = text.replace(u, final_link)
                 converted_count += 1
+                log.info("Converted deal link: %s -> %s -> %s", u, clean_url[:60], final_link)
         except Exception as e:
             log.warning("Error converting deal URL %s: %s", u, e)
             continue
@@ -869,7 +959,7 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
             url = getattr(ent, "url", None)
             if url:
                 clean_ent = clean_url_formatting(url)
-                if _host_matches(urlparse(clean_ent).netloc):
+                if is_deal_target_candidate(clean_ent):
                     display_text = display_text[:ent.offset] + clean_ent + display_text[ent.offset + ent.length:]
 
         is_real_media = bool(
