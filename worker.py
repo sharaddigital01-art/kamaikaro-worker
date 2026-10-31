@@ -403,6 +403,37 @@ async def api_save_user_config(payload: dict[str, Any]) -> dict:
         return {"error": str(e), "_status": 500}
 
 
+def extract_amazon_asin(url: str) -> Optional[str]:
+    """Extract 10-character Amazon ASIN from path or query parameters."""
+    if not url:
+        return None
+    # 1. Path pattern: /dp/ASIN, /gp/product/ASIN, /gp/aw/d/ASIN, /product/ASIN, /d/ASIN, /deal/ASIN, /ASIN/ASIN
+    m = re.search(r"/(?:dp|product|gp/product|gp/aw/d|d|deal|ASIN)/([a-zA-Z0-9]{10})(?:[/?#&]|$)", url, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # 2. Query param: pd_rd_i=ASIN, asin=ASIN, creativeASIN=ASIN
+    m = re.search(r"[?&](?:pd_rd_i|asin|creativeasin)=([a-zA-Z0-9]{10})(?:[&#]|$)", url, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # 3. Direct B0-prefixed ASIN segment in path
+    m = re.search(r"/(B0[a-zA-Z0-9]{8})(?:[/?#&]|$)", url, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def clean_amazon_associate_tag(raw_tag: str) -> str:
+    if not raw_tag:
+        return ""
+    tag = raw_tag.strip()
+    if tag.lower().startswith("tag="):
+        tag = tag[4:].strip()
+    elif tag.lower().startswith("tag ="):
+        tag = tag[5:].strip()
+    tag = re.sub(r"\s+", "", tag)
+    return tag
+
+
 def parse_config(raw: dict) -> Optional[UserConfig]:
     try:
         raw_sources = raw.get("sourceChannels") or []
@@ -441,13 +472,13 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             or ""
         )
 
-        parsed_amazon_tag = str(
+        parsed_amazon_tag = clean_amazon_associate_tag(str(
             raw.get("amazonTag")
             or raw.get("amazon_tag")
             or (raw.get("user") or {}).get("amazonTag")
             or (raw.get("user") or {}).get("amazon_tag")
             or ""
-        ).strip()
+        ))
 
         return UserConfig(
             user_id=str(raw["userId"]),
@@ -634,14 +665,36 @@ def is_amazon_url(url: str) -> bool:
         return False
 
 
-def to_amazon_affiliate_url(url: str, amazon_tag: str) -> str:
-    """Strip old affiliate params and attach user's direct Amazon Associate Tag."""
+def to_amazon_affiliate_url(url: str, amazon_tag: str, fallback_url: Optional[str] = None) -> str:
+    """Generate clean direct Amazon affiliate URL:
+    https://www.amazon.in/dp/{asin}?tag={user_amazon_tag}
+    Strip out all extra ref, session, and tracking clutter.
+    Preserves exact unbroken single-line URL formatting.
+    """
+    clean_tag = clean_amazon_associate_tag(amazon_tag)
+    if not clean_tag:
+        return clean_url_formatting(url)
+
+    asin = extract_amazon_asin(url) or (extract_amazon_asin(fallback_url) if fallback_url else None)
+    if asin:
+        return clean_url_formatting(f"https://www.amazon.in/dp/{asin}?tag={clean_tag}")
+
     clean = strip_affiliate_params(clean_url_formatting(url))
     p = urlparse(clean)
+    clutter_keys = {
+        "tag", "tag_id", "ascsubtag", "linkcode", "ref", "ref_",
+        "pf_rd_r", "pf_rd_m", "pf_rd_s", "pf_rd_t", "pf_rd_i", "pf_rd_p",
+        "pd_rd_r", "pd_rd_w", "pd_rd_wg", "qid", "sr", "crid", "sprefix",
+        "creative", "camp", "creativeasin", "source", "share_tag",
+    }
     q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-         if k.lower() not in ("tag", "tag_id", "ascsubtag", "linkcode")]
-    q.append(("tag", amazon_tag.strip()))
-    return clean_url_formatting(urlunparse(p._replace(query=urlencode(q))))
+         if k.lower() not in clutter_keys and not k.lower().startswith("ref")]
+    q.append(("tag", clean_tag))
+    clean_path = re.sub(r"/ref=[^/?#]+", "", p.path)
+    domain = p.netloc.lower().split(":")[0] if p.netloc else "www.amazon.in"
+    if "amazon" in domain:
+        domain = "www.amazon.in"
+    return clean_url_formatting(urlunparse(p._replace(netloc=domain, path=clean_path, query=urlencode(q))))
 
 
 async def api_shorten_link(original_url: str, user_id: Optional[str] = None) -> Optional[str]:
@@ -749,29 +802,27 @@ async def convert_text(
             is_amz = is_amazon_url(target_url) or is_amazon_url(u)
 
             # --------------------------------------------------------------- #
-            # Smart Deal Conversion Logic:
-            # 1. Amazon deals with user Amazon Associate Tag -> Route Directly!
-            # 2. Other deals (Flipkart, Myntra, Ajio, or no Amazon tag) -> Cuelinks
+            # Selective Deal Conversion & Shortening Logic:
+            # 1. Direct Amazon Deals (destination is Amazon AND user has amazon_tag):
+            #    - Generate clean direct Amazon affiliate URL:
+            #      https://www.amazon.in/dp/{asin}?tag={user_amazon_tag}
+            #    - DO NOT call /api/links/shorten (bypass custom shortener)
+            #    - Directly use this clean Amazon link in the Telegram caption
+            # 2. Other Deals (Flipkart, Myntra, Ajio, or Cuelinks routed):
+            #    - Convert via Cuelinks and call api_shorten_link() to brand
+            #      as https://kamaikaro.in/{slug} with seamless Cuelinks fallback
             # --------------------------------------------------------------- #
             if is_amz and amazon_tag:
-                direct_amz = to_amazon_affiliate_url(target_url, amazon_tag)
-
-                # Attempt custom Kamaikaro link shortening (7-second timeout)
-                short_url = None
-                try:
-                    short_url = await api_shorten_link(direct_amz, user_id=user_id)
-                except Exception as short_err:
-                    log.warning("api_shorten_link error for direct Amazon deal: %s; falling back to clean Amazon URL", short_err)
-                    short_url = None
-
-                # Branded short link if generated, else clean direct Amazon affiliate URL
-                final_link = clean_url_formatting(short_url) if short_url else direct_amz
+                direct_amz = clean_url_formatting(to_amazon_affiliate_url(target_url, amazon_tag, fallback_url=u))
+                # DO NOT call api_shorten_link for direct Amazon affiliate links!
+                # Directly use this clean Amazon link in the final Telegram post caption
+                final_link = direct_amz
                 text = text.replace(u, final_link)
                 converted_count += 1
-                log.info("Converted Amazon deal via direct Associate Tag (%s): %s -> %s", amazon_tag, u, final_link)
+                log.info("Converted Amazon deal via direct Associate Tag (%s): %s -> %s (bypassed custom shortener)", amazon_tag, u, final_link)
 
             elif sub_id and dest_host and not any(dest_host == d or dest_host.endswith("." + d) for d in EXCLUDED_DOMAINS):
-                # Standard Cuelinks Conversion
+                # Standard Cuelinks Conversion (Flipkart, Myntra, Ajio, or deals routed through Cuelinks)
                 cuelink = clean_url_formatting(to_cuelinks(clean_url, sub_id))
 
                 # Attempt custom Kamaikaro link shortening (7-second timeout)
@@ -791,29 +842,31 @@ async def convert_text(
             else:
                 # Other generic deal targets
                 if is_amz and amazon_tag:
-                    fallback_url = to_amazon_affiliate_url(target_url, amazon_tag)
+                    fallback_url = clean_url_formatting(to_amazon_affiliate_url(target_url, amazon_tag, fallback_url=u))
+                    final_link = fallback_url
                 elif sub_id:
                     fallback_url = clean_url_formatting(to_cuelinks(u, sub_id))
+                    short_url = None
+                    try:
+                        short_url = await api_shorten_link(fallback_url, user_id=user_id)
+                    except Exception:
+                        pass
+                    final_link = clean_url_formatting(short_url) if short_url else fallback_url
                 else:
-                    fallback_url = clean_url
+                    fallback_url = clean_url_formatting(clean_url)
+                    final_link = fallback_url
 
-                short_url = None
-                try:
-                    short_url = await api_shorten_link(fallback_url, user_id=user_id)
-                except Exception:
-                    pass
-                final_link = clean_url_formatting(short_url) if short_url else fallback_url
                 text = text.replace(u, final_link)
                 converted_count += 1
         except Exception as e:
             log.warning("Error in convert_text for URL %s: %s; applying direct fallback", u, e)
             try:
-                if is_amazon_url(u) and amazon_tag:
-                    fallback_link = to_amazon_affiliate_url(u, amazon_tag)
+                if (is_amazon_url(u) or (target_url and is_amazon_url(target_url))) and amazon_tag:
+                    fallback_link = clean_url_formatting(to_amazon_affiliate_url(target_url or u, amazon_tag, fallback_url=u))
                 elif sub_id:
                     fallback_link = clean_url_formatting(to_cuelinks(u, sub_id))
                 else:
-                    fallback_link = u
+                    fallback_link = clean_url_formatting(u)
                 text = text.replace(u, fallback_link)
                 converted_count += 1
             except Exception:
@@ -867,19 +920,20 @@ async def resolve_user_sub_id(user: UserConfig) -> str:
 
 async def resolve_user_amazon_tag(user: UserConfig) -> str:
     """Strictly resolve user's Amazon Associate Tag from memory/state or database."""
-    tag = user.amazon_tag or _telegram_to_amazon_tag.get(str(user.telegram_user_id)) or ""
+    tag = clean_amazon_associate_tag(user.amazon_tag or _telegram_to_amazon_tag.get(str(user.telegram_user_id)) or "")
 
     if not tag and user.user_id:
         try:
             configs = await api_fetch_configs(user_id=user.user_id)
             if configs:
-                tag = str(
+                raw_tag = str(
                     configs[0].get("amazonTag")
                     or configs[0].get("amazon_tag")
                     or (configs[0].get("user") or {}).get("amazonTag")
                     or (configs[0].get("user") or {}).get("amazon_tag")
                     or ""
                 ).strip()
+                tag = clean_amazon_associate_tag(raw_tag)
                 if tag:
                     user.amazon_tag = tag
                     if user.telegram_user_id:
@@ -891,13 +945,14 @@ async def resolve_user_amazon_tag(user: UserConfig) -> str:
         try:
             configs = await api_fetch_configs(telegram_id=user.telegram_user_id)
             if configs:
-                tag = str(
+                raw_tag = str(
                     configs[0].get("amazonTag")
                     or configs[0].get("amazon_tag")
                     or (configs[0].get("user") or {}).get("amazonTag")
                     or (configs[0].get("user") or {}).get("amazon_tag")
                     or ""
                 ).strip()
+                tag = clean_amazon_associate_tag(raw_tag)
                 if tag:
                     user.amazon_tag = tag
                     _telegram_to_amazon_tag[str(user.telegram_user_id)] = tag
