@@ -116,8 +116,49 @@ MESSAGE_LIMIT = 4096
 # Deduplication cache for incoming messages (chat_id, msg_id) -> timestamp
 _seen_posts: dict[tuple[int | str, int], float] = {}
 
-# In-memory tracking for pending logins: tg_user_id -> dict
-_pending_logins: dict[int, dict[str, Any]] = {}
+# In-memory tracking for pending logins: keyed by telegram_user_id (int and str)
+login_sessions: dict[Any, dict[str, Any]] = {}
+_pending_logins = login_sessions  # backwards-compatible alias
+
+
+def get_login_session(user_id: int | str) -> Optional[dict[str, Any]]:
+    now = time.time()
+    sess = (
+        login_sessions.get(user_id)
+        or login_sessions.get(int(user_id) if str(user_id).lstrip("-").isdigit() else None)
+        or login_sessions.get(str(user_id))
+    )
+    if sess:
+        # Do not expire for at least 10 minutes (600 seconds)
+        if now - sess.get("timestamp", now) > 600:
+            client = sess.get("client")
+            if client:
+                try:
+                    asyncio.create_task(client.disconnect())
+                except Exception:
+                    pass
+            pop_login_session(user_id)
+            return None
+        return sess
+    return None
+
+
+def set_login_session(user_id: int | str, data: dict[str, Any]) -> None:
+    data["timestamp"] = time.time()
+    login_sessions[user_id] = data
+    if isinstance(user_id, int):
+        login_sessions[str(user_id)] = data
+    elif str(user_id).lstrip("-").isdigit():
+        login_sessions[int(user_id)] = data
+
+
+def pop_login_session(user_id: int | str) -> Optional[dict[str, Any]]:
+    sess = login_sessions.pop(user_id, None)
+    if isinstance(user_id, int):
+        login_sessions.pop(str(user_id), None)
+    elif str(user_id).lstrip("-").isdigit():
+        login_sessions.pop(int(user_id), None)
+    return sess
 
 # In-memory drafts for channel selection: tg_user_id -> dict
 _channel_drafts: dict[int, dict[str, set[str]]] = {}
@@ -1430,8 +1471,8 @@ async def cancel_handler(event: Message | CallbackQuery, state: FSMContext) -> N
     # Preserve user_id and tracking_sub_id when clearing state
     user_id = (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
     sub_id = (await state.get_data()).get("tracking_sub_id") or (await state.get_data()).get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
-    pending = _pending_logins.pop(tg_user_id, None)
-    if pending:
+    pending = pop_login_session(tg_user_id)
+    if pending and pending.get("client"):
         try:
             await pending["client"].disconnect()
         except Exception:
@@ -1500,8 +1541,8 @@ async def start_login(event: Message | CallbackQuery, state: FSMContext) -> None
     _telegram_to_user_id[str(tg_user_id)] = user_id
     if sub_id:
         _telegram_to_sub_id[str(tg_user_id)] = sub_id
-    pending = _pending_logins.pop(tg_user_id, None)
-    if pending:
+    pending = pop_login_session(tg_user_id)
+    if pending and pending.get("client"):
         try:
             await pending["client"].disconnect()
         except Exception:
@@ -1537,13 +1578,24 @@ async def process_phone(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Invalid format. Please enter phone number starting with +, e.g. <code>+919876543210</code>:")
         return
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    client = TelegramClient(
+        StringSession(),
+        API_ID,
+        API_HASH,
+        auto_reconnect=True,
+        connection_retries=None,
+        retry_delay=1,
+        timeout=30,
+    )
     await client.connect()
     try:
         req = await client.send_code_request(phone)
     except Exception as e:
         log.warning("send_code_request error for %s: %s", phone, e)
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         await message.answer(f"❌ Failed to send code from Telegram: {e}\n\nPlease try again with /login.")
         await state.clear()
         return
@@ -1553,13 +1605,17 @@ async def process_phone(message: Message, state: FSMContext) -> None:
     user_id = state_data.get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
     sub_id = state_data.get("tracking_sub_id") or state_data.get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
 
-    _pending_logins[tg_user_id] = {
-        "client": client,
-        "phone": phone,
-        "phone_code_hash": req.phone_code_hash,
-        "user_id": user_id,
-        "sub_id": sub_id,
-    }
+    set_login_session(
+        tg_user_id,
+        {
+            "client": client,
+            "phone": phone,
+            "phone_code_hash": req.phone_code_hash,
+            "user_id": user_id,
+            "sub_id": sub_id,
+            "timestamp": time.time(),
+        },
+    )
     state_updates: dict[str, Any] = {
         "phone": phone,
         "phone_code_hash": req.phone_code_hash,
@@ -1584,10 +1640,10 @@ async def process_phone(message: Message, state: FSMContext) -> None:
 
 @router.message(LoginFSM.waiting_for_otp)
 async def process_otp(message: Message, state: FSMContext) -> None:
-    code = (message.text or "").strip().replace(" ", "").replace("-", "")
+    code = (message.text or "").replace(" ", "").replace("-", "").strip()
     tg_user_id = message.from_user.id
-    pending = _pending_logins.get(tg_user_id)
-    if not pending:
+    pending = get_login_session(tg_user_id)
+    if not pending or not pending.get("client"):
         await message.answer("⚠️ Session expired. Please start over with /login.")
         await state.clear()
         return
@@ -1598,9 +1654,16 @@ async def process_otp(message: Message, state: FSMContext) -> None:
     user_id = pending.get("user_id") or (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
     sub_id = pending.get("sub_id") or (await state.get_data()).get("tracking_sub_id") or (await state.get_data()).get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
 
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as ce:
+            log.warning("Reconnect client before sign_in failed: %s", ce)
+
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
     except SessionPasswordNeededError:
+        pending["timestamp"] = time.time()
         await state.set_state(LoginFSM.waiting_for_2fa)
         cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
         await message.answer(
@@ -1625,8 +1688,8 @@ async def process_otp(message: Message, state: FSMContext) -> None:
 async def process_2fa(message: Message, state: FSMContext) -> None:
     password = (message.text or "").strip()
     tg_user_id = message.from_user.id
-    pending = _pending_logins.get(tg_user_id)
-    if not pending:
+    pending = get_login_session(tg_user_id)
+    if not pending or not pending.get("client"):
         await message.answer("⚠️ Session expired. Please start over with /login.")
         await state.clear()
         return
@@ -1634,6 +1697,12 @@ async def process_2fa(message: Message, state: FSMContext) -> None:
     client: TelegramClient = pending["client"]
     user_id = pending.get("user_id") or (await state.get_data()).get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
     sub_id = pending.get("sub_id") or (await state.get_data()).get("tracking_sub_id") or (await state.get_data()).get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
+
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as ce:
+            log.warning("Reconnect client before 2fa sign_in failed: %s", ce)
 
     try:
         await client.sign_in(password=password)
@@ -1722,7 +1791,7 @@ async def finish_login(
     if state_updates:
         await state.update_data(**state_updates)
 
-    _pending_logins.pop(tg_user_id, None)
+    pop_login_session(tg_user_id)
 
     # Register live client
     await session_mgr.register_user_client(str(tg_user_id), client)
