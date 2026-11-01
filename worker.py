@@ -222,6 +222,17 @@ class ConfigStore:
                 return u
         return None
 
+    def remove_by_telegram_id(self, tg_id: int | str) -> Optional[UserConfig]:
+        s_id = str(tg_id).strip()
+        found_key = None
+        for uid, u in list(self.users.items()):
+            if str(u.telegram_user_id).strip() == s_id:
+                found_key = uid
+                break
+        if found_key:
+            return self.users.pop(found_key, None)
+        return None
+
     def all_sources(self) -> set[str]:
         s: set[str] = set()
         for u in self.users.values():
@@ -1092,6 +1103,20 @@ class MultiSessionManager:
             return await self.get_or_create_client(SESSION_STRING, "global-default")
         return None
 
+    async def disconnect_user(self, telegram_user_id: int | str) -> None:
+        s_id = str(telegram_user_id).strip()
+        async with self._lock:
+            session_str = self.user_sessions.pop(s_id, None)
+            if session_str and session_str != SESSION_STRING:
+                if session_str not in self.user_sessions.values():
+                    client = self.clients.pop(session_str, None)
+                    if client:
+                        try:
+                            await client.disconnect()
+                            log.info("Disconnected Telethon client for user %s", s_id)
+                        except Exception as e:
+                            log.warning("Error disconnecting client for %s: %s", s_id, e)
+
     async def disconnect_all(self) -> None:
         async with self._lock:
             for s, c in list(self.clients.items()):
@@ -1344,13 +1369,14 @@ HELP_TEXT = (
     "• /login - Connect your personal Telegram account\n"
     "• /select_channels or /mychannels - Select Source & Target channels\n"
     "• /status - View your automation status & SubID\n"
+    "• /disconnect - Disconnect your Telegram session\n"
     "• /cancel - Cancel any ongoing action\n\n"
     "Deals from your chosen source channels are automatically converted with your "
     "tracking SubID and posted straight to your channel!"
 )
 
 
-def get_main_menu_keyboard(is_logged_in: bool = False) -> InlineKeyboardMarkup:
+def get_main_menu_keyboard(is_logged_in: bool = False, is_linked: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(
@@ -1363,6 +1389,10 @@ def get_main_menu_keyboard(is_logged_in: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⚙️ Automation Status", callback_data="menu:status"),
         ],
     ]
+    if is_logged_in or is_linked:
+        buttons.append([
+            InlineKeyboardButton(text="🔌 Disconnect Session", callback_data="menu:disconnect")
+        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1433,7 +1463,7 @@ async def cmd_start(message: Message, command: CommandObject = None, state: FSMC
                 f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
                 f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id_display}</code>\n\n"
                 "👉 Tap <b>[📱 Login Telegram Account]</b> below to link your Telegram session so KamaiKaro can access your channels:",
-                reply_markup=get_main_menu_keyboard(is_logged_in=False),
+                reply_markup=get_main_menu_keyboard(is_logged_in=False, is_linked=True),
                 parse_mode="HTML",
             )
             return
@@ -1474,7 +1504,7 @@ async def cmd_start(message: Message, command: CommandObject = None, state: FSMC
             f"👤 <b>Linked User ID:</b> <code>{stored_user_id}</code>\n"
             f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id}</code>\n\n"
             "Select an option below to manage your automation:",
-            reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in),
+            reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in, is_linked=True),
             parse_mode="HTML",
         )
         return
@@ -1513,7 +1543,7 @@ async def cb_main_menu(query: CallbackQuery, state: FSMContext = None) -> None:
     await query.message.edit_text(
         f"👋 <b>KamaiKaro Deal Automation Bot Menu</b>\n{user_info}\n"
         "Choose an action below:",
-        reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in),
+        reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in, is_linked=bool(stored_user_id)),
         parse_mode="HTML",
     )
     await query.answer()
@@ -1547,6 +1577,133 @@ async def cancel_handler(event: Message | CallbackQuery, state: FSMContext) -> N
     await msg.answer("❌ Action cancelled. Tap /start to open the main menu.")
     if isinstance(event, CallbackQuery):
         await event.answer()
+
+
+@router.message(Command("disconnect"))
+@router.callback_query(F.data == "menu:disconnect")
+async def disconnect_handler(event: Message | CallbackQuery, state: FSMContext = None) -> None:
+    tg_user = event.from_user
+    if tg_user is None:
+        return
+    tg_user_id = tg_user.id
+    s_tg_id = str(tg_user_id)
+
+    log.info("Processing disconnect for Telegram user: %s", s_tg_id)
+
+    # 1. Retrieve user identity before clearing
+    state_data = await state.get_data() if state else {}
+    user_id = _telegram_to_user_id.get(s_tg_id) or state_data.get("user_id")
+    u_cfg = store.get_by_telegram_id(tg_user_id)
+    if not user_id and u_cfg and u_cfg.user_id:
+        user_id = u_cfg.user_id
+
+    # 2. Disconnect Telethon client and clear pending login sessions
+    await session_mgr.disconnect_user(tg_user_id)
+    pending = pop_login_session(tg_user_id)
+    if pending and pending.get("client"):
+        try:
+            await pending["client"].disconnect()
+        except Exception:
+            pass
+
+    # 3. Stop listening or auto-posting for this user's configured target channel immediately
+    store.remove_by_telegram_id(tg_user_id)
+    if user_id:
+        store.users.pop(str(user_id), None)
+    if u_cfg:
+        u_cfg.is_active = False
+        u_cfg.session_string = ""
+        u_cfg.target_channel_id = None
+        u_cfg.target_channels = []
+        u_cfg.source_channels = []
+        u_cfg.source_channels_raw = []
+
+    # 4. Clear in-memory mappings and caches for this Telegram chat ID
+    _telegram_to_user_id.pop(s_tg_id, None)
+    _telegram_to_sub_id.pop(s_tg_id, None)
+    _telegram_to_amazon_tag.pop(s_tg_id, None)
+    _channel_drafts.pop(tg_user_id, None)
+    _dialogs_cache.pop(tg_user_id, None)
+
+    # 5. Clear FSM state completely
+    if state:
+        await state.clear()
+
+    # 6. Clear session and subId link in database / web backend
+    if user_id:
+        try:
+            await api_save_user_config({
+                "userId": user_id,
+                "telegramUserId": s_tg_id,
+                "sessionString": "",
+                "sourceChannels": [],
+                "targetChannels": [],
+                "targetChannelId": None,
+                "targetChannelName": "",
+                "isActive": False,
+            })
+        except Exception as e:
+            log.warning("api_save_user_config error on disconnect for %s: %s", user_id, e)
+
+        try:
+            await api_save_session(
+                session_string="",
+                telegram_user_id=tg_user_id,
+                telegram_username=tg_user.username or "",
+                user_id=user_id,
+            )
+        except Exception as e:
+            log.warning("api_save_session error on disconnect for %s: %s", user_id, e)
+
+        try:
+            s = await http()
+            await s.post(
+                f"{BASE_WEB_URL}/api/telegram/disconnect",
+                json={"userId": user_id, "telegramUserId": s_tg_id},
+                timeout=aiohttp.ClientTimeout(total=5.0),
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            await api_save_session(
+                session_string="",
+                telegram_user_id=tg_user_id,
+                telegram_username=tg_user.username or "",
+            )
+        except Exception as e:
+            log.warning("api_save_session error on disconnect for tg_id %s: %s", tg_user_id, e)
+
+    # Refresh store configs in background
+    asyncio.create_task(refresh_configs())
+
+    # 7. Send confirmation message and show initial unauthenticated state
+    confirmation_text = (
+        "🔌 <b>Account Disconnected</b>\n\n"
+        "Your account has been disconnected successfully. Use /start or login from kamaikaro.in to connect again."
+    )
+
+    dashboard_url = f"{BASE_WEB_URL}/telegram-bot"
+    unlinked_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Open Web Dashboard", url=dashboard_url)],
+        [InlineKeyboardButton(text="🔄 Reconnect Account", callback_data="menu:main")],
+    ])
+
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(
+            confirmation_text,
+            reply_markup=unlinked_kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        await event.answer("Disconnected successfully.")
+    else:
+        await event.answer(
+            confirmation_text,
+            reply_markup=unlinked_kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -2339,6 +2496,7 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📢 Select Channels", callback_data="menu:channels")],
             [InlineKeyboardButton(text="🔄 Re-login", callback_data="menu:login")],
+            [InlineKeyboardButton(text="🔌 Disconnect Session", callback_data="menu:disconnect")],
             [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu:main")],
         ])
 
