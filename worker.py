@@ -1899,6 +1899,22 @@ async def process_phone(message: Message, state: FSMContext) -> None:
     user_id = state_data.get("user_id") or _telegram_to_user_id.get(str(tg_user_id))
     sub_id = state_data.get("tracking_sub_id") or state_data.get("sub_id") or _telegram_to_sub_id.get(str(tg_user_id))
 
+    sent_type_name = type(getattr(req, "type", None)).__name__
+    raw_type = getattr(req, "type", None)
+    next_type_name = type(getattr(req, "next_type", None)).__name__ if getattr(req, "next_type", None) else None
+    timeout_sec = getattr(req, "timeout", None)
+
+    logger.info(
+        "send_code_request response: phone=%s, sent_code_type=%s, full_type=%r, phone_code_hash=%s, timeout=%s, next_type=%s, raw=%r",
+        phone,
+        sent_type_name,
+        raw_type,
+        getattr(req, "phone_code_hash", None),
+        timeout_sec,
+        next_type_name,
+        req,
+    )
+
     set_login_session(
         tg_user_id,
         {
@@ -1921,11 +1937,40 @@ async def process_phone(message: Message, state: FSMContext) -> None:
     await state.update_data(**state_updates)
     await state.set_state(LoginFSM.waiting_for_otp)
 
+    if sent_type_name == "SentCodeTypeApp":
+        delivery_info = (
+            "📲 <b>Delivery: Official Telegram Mobile App</b>\n\n"
+            f"Telegram sent the verification code to the official Telegram chat (<b>Telegram / 777000</b>) on your phone.\n\n"
+            "⚠️ <b>Can't find the code in chat 777000?</b>\n"
+            f"• Check your <b>mobile app</b> (iOS/Android) logged into <code>{phone}</code>.\n"
+            "• If you have multiple accounts, switch to the profile with this exact phone number.\n"
+            "• Telegram blocks code delivery to Web/Desktop clients for 3rd-party apps."
+        )
+    elif sent_type_name == "SentCodeTypeSms":
+        delivery_info = (
+            "📩 <b>Delivery: Cellular SMS Text Message</b>\n\n"
+            f"Telegram dispatched your verification code via <b>SMS</b> to <code>{phone}</code>.\n\n"
+            "⚠️ <b>Check your phone's SMS inbox (Messages app)</b>, NOT Telegram chat 777000.\n"
+            "<i>(Carrier SMS delivery can take up to 60-120 seconds in India)</i>"
+        )
+    elif sent_type_name == "SentCodeTypeCall":
+        delivery_info = (
+            "📞 <b>Delivery: Voice Phone Call</b>\n\n"
+            f"Telegram will call <code>{phone}</code> to dictate your login code."
+        )
+    elif sent_type_name == "SentCodeTypeFlashCall":
+        delivery_info = (
+            "📞 <b>Delivery: Flash Call</b>\n\n"
+            f"Telegram will flash-call <code>{phone}</code>. Enter the required digits from the caller number."
+        )
+    else:
+        delivery_info = f"📩 Telegram dispatched your verification code ({sent_type_name}) to <code>{phone}</code>."
+
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="login:cancel")]])
     await message.answer(
-        f"📩 <b>OTP sent to {phone}!</b>\n\n"
-        "Telegram has sent a verification code to your Telegram app (or SMS).\n\n"
-        "👉 Enter the code here:\n"
+        f"🔐 <b>Verification Code Dispatched!</b>\n\n"
+        f"{delivery_info}\n\n"
+        "👉 <b>Enter the code here:</b>\n"
         "<i>(e.g. <code>12345</code> or <code>1 2 3 4 5</code>)</i>",
         reply_markup=cancel_kb,
         parse_mode="HTML",
