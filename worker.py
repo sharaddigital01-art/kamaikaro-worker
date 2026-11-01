@@ -36,7 +36,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
-    WebAppInfo,
 )
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
@@ -81,7 +80,6 @@ VERIFY_URL = f"{BASE_WEB_URL}/api/telegram/verify-sync"
 CONFIG_URL = f"{BASE_WEB_URL}/api/telegram/user-config"
 SAVE_SESSION_URL = f"{BASE_WEB_URL}/api/telegram/save-session"
 CHANNELS_URL = f"{BASE_WEB_URL}/api/telegram/channels"
-REDIRECT_APP_BASE = os.getenv("REDIRECT_APP_BASE", "https://www.kamaikaro.in").rstrip("/")
 
 SHORTENER_DOMAINS = (
     "amazn.lt", "amzn.to", "amzn.in", "amzn.cl", "amzn.eu", "a.co",
@@ -894,10 +892,9 @@ async def api_shorten_link(
 
 
 def strip_deal_links_and_clean_caption(text: str) -> str:
-    """Remove deal links and CTA link phrases completely from caption text,
-    leaving a 100% clean deal post for display above the inline button.
-    This eliminates text hyperlinks so users tap the direct button without
-    Telegram's 'Open link? Cancel / Open' confirmation popup.
+    """Remove all deal links, markdown hyperlinks, and CTA phrases completely from caption text,
+    leaving a 100% clean deal post (Title, Features, MRP, Deal Price, Discount) with ZERO text links.
+    All deal links MUST only exist on the native inline button below the message.
     """
     if not text:
         return ""
@@ -914,10 +911,17 @@ def strip_deal_links_and_clean_caption(text: str) -> str:
     ]
 
     link_line_pattern = re.compile(
-        r"^(?:👉\s*|🛒\s*|🔗\s*|⚡\s*|🔥\s*)?"
-        r"(?:\*\*)?(?:buy\s*(?:now|here)?|grab\s*(?:deal|now|here)?|order\s*(?:now|here)?|deal\s*link|link|shop\s*now|view\s*deal)(?:\*\*)?\s*"
-        r"[:\-–—]?\s*"
-        r"(?:https?://[^\s]+|\[(?:Buy Now|View Deal|Buy Now / View Deal)[^\]]*\]\([^)]+\))?\s*$",
+        r"^(?:👉|🛒|🛍️|🔗|⚡|🔥|📌|👉🏻|👉🏼|👉🏽|👉🏾|👉🏿|\*|\s)*"
+        r"(?:buy\s*(?:on\s*\w+|now|here)?|grab\s*(?:deal|now|here|on\s*\w+)?|order\s*(?:now|here|on\s*\w+)?|"
+        r"shop\s*(?:now|here|on\s*\w+)?|deal\s*link|link|view\s*deal|check\s*here|get\s*it\s*here|direct\s*link)"
+        r"(?:\*|\s)*[:\-–—]?\s*"
+        r"(?:https?://[^\s]+|\[[^\]]+\]\([^)]+\))?\s*$",
+        re.IGNORECASE,
+    )
+
+    cta_words_re = re.compile(
+        r"^(?:[👉🛒🛍️🔗⚡🔥📌👉🏻👉🏼👉🏽👉🏾👉🏿\*\s:\-–—\(\)\[\]/\\|.]|"
+        r"buy|now|here|order|grab|deal|link|links|shop|view|on|at|get|it|amazon|flipkart|myntra|ajio|store)+$",
         re.IGNORECASE,
     )
 
@@ -933,24 +937,29 @@ def strip_deal_links_and_clean_caption(text: str) -> str:
         if link_line_pattern.match(line):
             continue
 
+        # If line is only a bare URL or markdown link, skip it
         if re.match(r"^https?://[^\s]+$", line) or re.match(r"^\[[^\]]+\]\([^)]+\)$", line):
             continue
 
+        # Strip inline URLs and markdown links from the line
         line_clean = re.sub(
-            r"\s*(?:👉\s*|🛒\s*|🔗\s*)?(?:buy\s*(?:now|here)?|grab\s*(?:deal|now|here)?|order\s*(?:now|here)?|link)?\s*[:\-–—]?\s*(?:https?://[^\s]+|\[[^\]]+\]\([^)]+\))\s*$",
+            r"\s*(?:👉|🛒|🛍️|🔗|⚡|🔥|📌)?\s*(?:buy\s*(?:on\s*\w+|now|here)?|grab\s*(?:deal|now|here|on\s*\w+)?|order\s*(?:now|here)?|shop\s*now|link|deal\s*link)?\s*[:\-–—]?\s*(?:https?://[^\s]+|\[[^\]]+\]\([^)]+\))\s*$",
             "",
             line,
             flags=re.IGNORECASE,
         ).strip()
 
+        # Remove any remaining raw URLs
         line_clean = re.sub(r"https?://[^\s<>\"')\]]+", "", line_clean).strip()
+        # Remove markdown hyperlinks [Buy Now](...) or [Text](...)
+        line_clean = re.sub(r"\[(?:buy|now|deal|grab|shop|view|order|link|here)[^\]]*\]\([^)]+\)", "", line_clean, flags=re.I).strip()
         line_clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line_clean).strip()
 
-        if re.match(r"^(?:[👉🛒🔗⚡🔥\*\s:\-–—]|buy|now|here|order|grab|deal|link|shop)+$", line_clean, re.I):
+        # If the remaining line is only CTA words/emojis/punctuation, discard it
+        if not line_clean or cta_words_re.match(line_clean):
             continue
 
-        if line_clean:
-            cleaned_lines.append(line_clean)
+        cleaned_lines.append(line_clean)
 
     while cleaned_lines and cleaned_lines[-1] == "":
         cleaned_lines.pop()
@@ -1009,31 +1018,38 @@ def format_caption_with_links(clean_caption: str, converted_deals: list[dict[str
     return links_block
 
 
-def get_redirect_launcher_url(target_url: str) -> str:
-    """Construct Telegram WebApp launcher URL that opens target affiliate link
-    via window.Telegram.WebApp.openLink(), eliminating the native OS/Telegram 'Open link?'
-    confirmation dialog and launching the native store app directly.
+def get_deal_button_label(store: str, is_amz: bool = False) -> str:
+    """Format standardized, channel-supported deal button labels:
+    - Amazon: 🛒 BUY NOW ON AMAZON
+    - Flipkart: 🛍️ BUY ON FLIPKART
+    - Myntra: 🛍️ BUY ON MYNTRA
+    - Ajio: 🛍️ BUY ON AJIO
+    - Other stores: 🛍️ BUY ON {STORE}
     """
-    encoded = quote(target_url, safe="")
-    return f"{REDIRECT_APP_BASE}/api/redirect-app?url={encoded}"
+    store_clean = (store or "").strip()
+    store_lower = store_clean.lower()
+    if is_amz or "amazon" in store_lower:
+        return "🛒 BUY NOW ON AMAZON"
+    elif "flipkart" in store_lower:
+        return "🛍️ BUY ON FLIPKART"
+    elif "myntra" in store_lower:
+        return "🛍️ BUY ON MYNTRA"
+    elif "ajio" in store_lower:
+        return "🛍️ BUY ON AJIO"
+    elif store_clean and store_lower not in ("store", "deal"):
+        return f"🛍️ BUY ON {store_clean.upper()}"
+    else:
+        return "🛒 BUY NOW / GRAB DEAL"
 
 
 def make_aiogram_deal_button(btn_text: str, url: str) -> InlineKeyboardButton:
-    """Create an Aiogram WebApp button pointing to the instant redirect launcher."""
-    launcher_url = get_redirect_launcher_url(url)
-    return InlineKeyboardButton(text=btn_text, web_app=WebAppInfo(url=launcher_url))
+    """Create a channel-supported native URL inline button for Aiogram Bot."""
+    return InlineKeyboardButton(text=btn_text, url=url)
 
 
 def make_telethon_deal_button(btn_text: str, url: str) -> Any:
-    """Create a Telethon WebApp button pointing to the instant redirect launcher."""
-    launcher_url = get_redirect_launcher_url(url)
-    if hasattr(Button, "web_app"):
-        return getattr(Button, "web_app")(btn_text, launcher_url)
-    try:
-        from telethon.tl.types import KeyboardInlineButton, InlineButtonTypeWebView
-        return KeyboardInlineButton(text=btn_text, type=InlineButtonTypeWebView(url=launcher_url))
-    except Exception:
-        return Button.url(btn_text, launcher_url)
+    """Create a channel-supported native URL inline button for Telethon."""
+    return Button.url(btn_text, url)
 
 
 async def resolve_and_convert_deals(
@@ -1386,7 +1402,7 @@ class MultiSessionManager:
                         if not (event.is_channel or event.is_group):
                             return
                         if self.bot_instance:
-                            await handle_new_post(event, self.bot_instance)
+                            asyncio.create_task(handle_new_post(event, self.bot_instance))
                     except Exception as err:
                         log.error("Unhandled error in _on_msg event listener: %s", err, exc_info=True)
 
@@ -1444,7 +1460,7 @@ class MultiSessionManager:
                 if not (event.is_channel or event.is_group):
                     return
                 if self.bot_instance:
-                    await handle_new_post(event, self.bot_instance)
+                    asyncio.create_task(handle_new_post(event, self.bot_instance))
             except Exception as err:
                 log.error("Unhandled error in user _on_msg listener: %s", err, exc_info=True)
 
@@ -1509,6 +1525,120 @@ def chat_keys(chat: Any) -> set[str]:
     return keys
 
 
+async def bot_send_with_retry(
+    bot: Bot,
+    target: Any,
+    caption: str,
+    media_path: Optional[str],
+    is_real_media: bool,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    max_retries: int = 2,
+) -> bool:
+    """Send post to target channel via Aiogram Bot with retry logic and media fallback.
+    Uses standard native URL buttons strictly supported by Telegram Channels.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            if is_real_media and media_path and os.path.exists(media_path):
+                file_input = FSInputFile(media_path)
+                if len(caption) <= CAPTION_LIMIT:
+                    try:
+                        await bot.send_photo(target, file_input, caption=caption, reply_markup=reply_markup)
+                        return True
+                    except Exception as photo_err:
+                        try:
+                            await bot.send_document(target, file_input, caption=caption, reply_markup=reply_markup)
+                            return True
+                        except Exception:
+                            log.warning("Bot media upload failed (%s); falling back to text message with buttons", photo_err)
+                else:
+                    try:
+                        sent = await bot.send_photo(target, file_input)
+                        await bot.send_message(target, caption[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, reply_markup=reply_markup)
+                        return True
+                    except Exception:
+                        try:
+                            sent = await bot.send_document(target, file_input)
+                            await bot.send_message(target, caption[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, reply_markup=reply_markup)
+                            return True
+                        except Exception:
+                            log.warning("Bot media chunked send failed; falling back to text message with buttons")
+
+            # Text-only send (or media fallback)
+            await bot.send_message(target, caption[:MESSAGE_LIMIT], reply_markup=reply_markup)
+            return True
+
+        except Exception as e:
+            err_str = str(e)
+            retry_after = getattr(e, "retry_after", None)
+            if retry_after is not None and retry_after <= 15 and attempt < max_retries:
+                log.warning("Bot hit TelegramRetryAfter (%ss); sleeping and retrying for %s...", retry_after, target)
+                await asyncio.sleep(retry_after + 0.5)
+                continue
+            if attempt < max_retries and any(t in err_str.lower() for t in ("timeout", "connection reset", "network", "retry")):
+                await asyncio.sleep(1.0)
+                continue
+            log.warning("Bot Token posting to %s failed on attempt %d: %s", target, attempt + 1, e)
+            return False
+
+    return False
+
+
+async def telethon_send_with_retry(
+    u_client: TelegramClient,
+    target: Any,
+    caption: str,
+    media: Any,
+    media_path: Optional[str],
+    is_real_media: bool,
+    buttons: Any,
+    max_retries: int = 2,
+) -> bool:
+    """Send post via Telethon client with retry logic and clean caption (zero text links)."""
+    for attempt in range(max_retries + 1):
+        try:
+            file_to_send = media if media else (media_path if media_path and os.path.exists(media_path) else None)
+            if is_real_media and file_to_send:
+                if len(caption) <= CAPTION_LIMIT:
+                    try:
+                        await u_client.send_file(target, file=file_to_send, caption=caption, buttons=buttons)
+                        return True
+                    except Exception as btn_err:
+                        log.debug("Telethon send_file with buttons failed (%s); trying without buttons", btn_err)
+                        await u_client.send_file(target, file=file_to_send, caption=caption)
+                        return True
+                else:
+                    sent_media = await u_client.send_file(target, file=file_to_send)
+                    reply_id = getattr(sent_media, "id", None)
+                    try:
+                        await u_client.send_message(target, caption[:MESSAGE_LIMIT], reply_to=reply_id, buttons=buttons)
+                    except Exception:
+                        await u_client.send_message(target, caption[:MESSAGE_LIMIT], reply_to=reply_id)
+                    return True
+            else:
+                try:
+                    await u_client.send_message(target, caption[:MESSAGE_LIMIT], buttons=buttons)
+                except Exception:
+                    await u_client.send_message(target, caption[:MESSAGE_LIMIT])
+                return True
+
+        except FloodWaitError as fw:
+            if fw.seconds <= 15 and attempt < max_retries:
+                log.warning("Telethon FloodWait (%ds) on target %s; sleeping and retrying...", fw.seconds, target)
+                await asyncio.sleep(fw.seconds + 0.5)
+                continue
+            log.error("Telethon FloodWait (%ds) exceeded limit on target %s", fw.seconds, target)
+            return False
+        except Exception as e:
+            if attempt < max_retries:
+                await asyncio.sleep(1.0)
+                continue
+            log.error("Telethon send failed to %s on attempt %d: %s", target, attempt + 1, e)
+            return False
+
+    return False
+
+
 async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> None:
     # 1. Strictly resolve active user's SubID and Amazon Associate Tag from memory/state or database
     sub_id = await resolve_user_sub_id(user)
@@ -1518,38 +1648,28 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
     # 2. Extract and convert deal URLs (Amazon tag / Cuelinks)
     converted_deals = await resolve_and_convert_deals(text, sub_id=sub_id, user_id=uid, amazon_tag=amazon_tag)
 
-    # 3. Clean up caption completely: remove all URLs, Markdown hyperlinks [Buy Now](...),
-    # and CTA lines so caption is 100% clean and users tap the direct inline button without popups.
+    # 3. Clean up caption completely: remove all URLs, Markdown hyperlinks,
+    # and CTA lines so caption is 100% clean (Title, Features, MRP, Deal Price, Discount).
+    # ZERO text links in caption - all deal links MUST exist only on the native inline button below.
     clean_caption = strip_deal_links_and_clean_caption(text)
     if not clean_caption.strip():
         clean_caption = "🔥 Special Deal Offer"
 
-    # 4. Telethon User Client caption (with clean, prominent clickable links appended)
-    # Telegram MTProto API restricts inline buttons to official Bot tokens only.
-    # When posting via Telethon User Client, we append clean clickable link(s) to the caption so no deal is missing links.
-    user_client_caption = format_caption_with_links(clean_caption, converted_deals)
-
-    # 5. Build official inline keyboard markup for Bot Token delivery
+    # 4. Build official channel-supported inline keyboard markup (Native URL buttons)
     aiogram_reply_markup = None
+    telethon_buttons = []
     if converted_deals:
         keyboard_rows = []
         for d in converted_deals:
             url = d["converted_url"]
             store = d.get("store", "Store")
-            if d.get("is_amz") or "amazon" in store.lower():
-                btn_text = "🛒 BUY NOW ON AMAZON"
-            elif "flipkart" in store.lower():
-                btn_text = "🛒 BUY NOW ON FLIPKART"
-            elif "myntra" in store.lower():
-                btn_text = "🛍️ BUY NOW ON MYNTRA"
-            elif "ajio" in store.lower():
-                btn_text = "🛍️ BUY NOW ON AJIO"
-            else:
-                btn_text = "🛒 BUY NOW / GRAB DEAL"
+            is_amz = bool(d.get("is_amz"))
+            btn_text = get_deal_button_label(store, is_amz)
             keyboard_rows.append([make_aiogram_deal_button(btn_text, url)])
+            telethon_buttons.append([make_telethon_deal_button(btn_text, url)])
         aiogram_reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
-    # 6. Resolve user's target channels
+    # 5. Resolve user's target channels
     targets = []
     if user.target_channel_id:
         targets.append(user.target_channel_id)
@@ -1571,60 +1691,51 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
 
     u_client = await session_mgr.get_client_for_telegram_id(user.telegram_user_id)
 
-    # 7. Post to each target channel using Dual-Mode Delivery
+    # 6. Post to each target channel using Dual-Mode Delivery with Retry Logic
     for target in targets:
         posted = False
 
         # ------------------------------------------------------------------- #
-        # MODE 1: Official Bot Token Delivery
-        # (If BOT_TOKEN is available and bot is admin in channel, post with
-        # official Telegram Inline Keyboard Buttons)
+        # MODE 1: Official Bot Token Delivery (Primary)
+        # Uses native Telegram URL inline buttons - supported by all channels
         # ------------------------------------------------------------------- #
         if bot and BOT_TOKEN:
             try:
-                if is_real_media and media_path and os.path.exists(media_path):
-                    file_input = FSInputFile(media_path)
-                    if len(clean_caption) <= CAPTION_LIMIT:
-                        try:
-                            await bot.send_photo(target, file_input, caption=clean_caption, reply_markup=aiogram_reply_markup)
-                        except Exception:
-                            await bot.send_document(target, file_input, caption=clean_caption, reply_markup=aiogram_reply_markup)
-                    else:
-                        try:
-                            sent = await bot.send_photo(target, file_input)
-                            await bot.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, reply_markup=aiogram_reply_markup)
-                        except Exception:
-                            sent = await bot.send_document(target, file_input)
-                            await bot.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, reply_markup=aiogram_reply_markup)
+                posted = await bot_send_with_retry(
+                    bot=bot,
+                    target=target,
+                    caption=clean_caption,
+                    media_path=media_path,
+                    is_real_media=is_real_media,
+                    reply_markup=aiogram_reply_markup,
+                )
+                if posted:
+                    log.info("Posted deal to target %s via official Bot Token with native inline buttons for user %s", target, user.user_id)
                 else:
-                    await bot.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_markup=aiogram_reply_markup)
-                posted = True
-                log.info("Posted deal to target %s via official Bot Token with inline buttons for user %s", target, user.user_id)
+                    log.info("Bot Token posting to %s failed; switching to Telethon User Client mode...", target)
             except Exception as bot_err:
-                log.info("Bot Token posting to %s not available or failed (%s); switching to Telethon User Client mode...", target, bot_err)
+                log.info("Bot Token posting to %s threw exception (%s); switching to Telethon User Client mode...", target, bot_err)
 
         # ------------------------------------------------------------------- #
-        # MODE 2: Telethon User Client Delivery
-        # (Telegram drops inline buttons on user accounts, so we post with
-        # clean, prominent clickable link(s) appended directly in the caption)
+        # MODE 2: Telethon User Client Delivery (Fallback)
         # ------------------------------------------------------------------- #
         if not posted and u_client and u_client.is_connected():
             try:
-                caption_to_send = user_client_caption if converted_deals else clean_caption
-                if is_real_media and (getattr(msg, "media", None) or media_path):
-                    file_to_send = msg.media if getattr(msg, "media", None) else media_path
-                    if len(caption_to_send) <= CAPTION_LIMIT:
-                        await u_client.send_file(target, file=file_to_send, caption=caption_to_send)
-                    else:
-                        sent_media = await u_client.send_file(target, file=file_to_send)
-                        reply_id = getattr(sent_media, "id", None)
-                        await u_client.send_message(target, caption_to_send[:MESSAGE_LIMIT], reply_to=reply_id)
+                posted = await telethon_send_with_retry(
+                    u_client=u_client,
+                    target=target,
+                    caption=clean_caption,
+                    media=getattr(msg, "media", None),
+                    media_path=media_path,
+                    is_real_media=is_real_media,
+                    buttons=telethon_buttons if telethon_buttons else None,
+                )
+                if posted:
+                    log.info("Posted deal to target %s via Telethon client for user %s", target, user.user_id)
                 else:
-                    await u_client.send_message(target, caption_to_send[:MESSAGE_LIMIT])
-                posted = True
-                log.info("Posted deal to target %s via Telethon User Client with clean clickable links for user %s", target, user.user_id)
+                    log.error("Telethon posting failed to %s for user %s", target, user.user_id)
             except Exception as client_err:
-                log.error("Telethon User Client posting also failed to %s for user %s: %s", target, user.user_id, client_err)
+                log.error("Telethon User Client posting exception for %s: %s", target, client_err)
 
 
 async def safe_post(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> bool:
@@ -1654,6 +1765,7 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
             if msg_fp in recent_deal_cache:
                 log.info("Duplicate post detected via source message ID %s:%s; skipping", chat_id, msg_id)
                 return
+            recent_deal_cache.add(msg_fp)
 
         chat = getattr(event, "chat", None)
         if chat is None:
