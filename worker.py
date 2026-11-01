@@ -38,7 +38,7 @@ from aiogram.types import (
     Message,
 )
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.errors import (
     ApiIdInvalidError,
     FloodWaitError,
@@ -891,6 +891,141 @@ async def api_shorten_link(
     return None
 
 
+def strip_deal_links_and_clean_caption(text: str) -> str:
+    """Remove deal links and CTA link phrases completely from caption text,
+    leaving a 100% clean deal post for display above the inline button.
+    This eliminates text hyperlinks so users tap the direct button without
+    Telegram's 'Open link? Cancel / Open' confirmation popup.
+    """
+    if not text:
+        return ""
+
+    lines = [line.strip() for line in text.strip().splitlines()]
+    cleaned_lines = []
+
+    promo_patterns = [
+        re.compile(r"^(?:join|follow|subscribe|more deals|more loots|updates on|channel)\b.*@\w+", re.I),
+        re.compile(r"^join\s+(?:our\s+)?(?:telegram|channel|group)\b.*$", re.I),
+        re.compile(r"^t\.me/[\w_]+(?:\s+for\s+more.*)?$", re.I),
+        re.compile(r"^forwarded\s+from\b.*$", re.I),
+        re.compile(r"^join\s+@\w+$", re.I),
+    ]
+
+    link_line_pattern = re.compile(
+        r"^(?:👉\s*|🛒\s*|🔗\s*|⚡\s*|🔥\s*)?"
+        r"(?:\*\*)?(?:buy\s*(?:now|here)?|grab\s*(?:deal|now|here)?|order\s*(?:now|here)?|deal\s*link|link|shop\s*now|view\s*deal)(?:\*\*)?\s*"
+        r"[:\-–—]?\s*"
+        r"(?:https?://[^\s]+|\[(?:Buy Now|View Deal|Buy Now / View Deal)[^\]]*\]\([^)]+\))?\s*$",
+        re.IGNORECASE,
+    )
+
+    for line in lines:
+        if not line:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+
+        if any(p.match(line) for p in promo_patterns):
+            continue
+
+        if link_line_pattern.match(line):
+            continue
+
+        if re.match(r"^https?://[^\s]+$", line) or re.match(r"^\[[^\]]+\]\([^)]+\)$", line):
+            continue
+
+        line_clean = re.sub(
+            r"\s*(?:👉\s*|🛒\s*|🔗\s*)?(?:buy\s*(?:now|here)?|grab\s*(?:deal|now|here)?|order\s*(?:now|here)?|link)?\s*[:\-–—]?\s*(?:https?://[^\s]+|\[[^\]]+\]\([^)]+\))\s*$",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        line_clean = re.sub(r"https?://[^\s<>\"')\]]+", "", line_clean).strip()
+        line_clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line_clean).strip()
+
+        if re.match(r"^(?:[👉🛒🔗⚡🔥\*\s:\-–—]|buy|now|here|order|grab|deal|link|shop)+$", line_clean, re.I):
+            continue
+
+        if line_clean:
+            cleaned_lines.append(line_clean)
+
+    while cleaned_lines and cleaned_lines[-1] == "":
+        cleaned_lines.pop()
+
+    result = "\n".join(cleaned_lines)
+    result = re.sub(r"\n{3,}", "\n\n", result).strip()
+    return result
+
+
+async def resolve_and_convert_deals(
+    text: str,
+    sub_id: str,
+    user_id: Optional[str] = None,
+    amazon_tag: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Extract deal URLs, unshorten them, apply affiliate tags/Cuelinks,
+    and return list of converted deals with store metadata for inline buttons.
+    """
+    if not text:
+        return []
+
+    urls = extract_deal_urls(text)
+    if not urls:
+        return []
+
+    converted_deals: list[dict[str, Any]] = []
+
+    for u in sorted(urls, key=len, reverse=True):
+        try:
+            target_url = u
+            if is_shortened_url(u):
+                try:
+                    target_url = await asyncio.wait_for(unshorten_url(u), timeout=4.0)
+                except Exception as unshort_err:
+                    log.warning("Unshorten failed for %s (%s); using original link", u, unshort_err)
+                    target_url = u
+
+            clean_url = strip_affiliate_params(target_url)
+            is_amz = is_amazon_url(target_url) or is_amazon_url(u)
+
+            if is_amz and amazon_tag:
+                converted_url = clean_url_formatting(to_amazon_affiliate_url(target_url, amazon_tag, fallback_url=u))
+                store = "Amazon"
+            elif is_amz and sub_id:
+                converted_url = clean_url_formatting(to_cuelinks(clean_url, sub_id))
+                store = "Amazon"
+            elif sub_id:
+                converted_url = clean_url_formatting(to_cuelinks(clean_url, sub_id))
+                if any(h in clean_url for h in ("flipkart", "fkrt")):
+                    store = "Flipkart"
+                elif any(h in clean_url for h in ("myntra", "myntr")):
+                    store = "Myntra"
+                elif "ajio" in clean_url:
+                    store = "Ajio"
+                else:
+                    store = "Deal"
+            elif is_amz:
+                converted_url = clean_url_formatting(clean_url)
+                store = "Amazon"
+            else:
+                converted_url = clean_url_formatting(clean_url)
+                store = "Deal"
+
+            converted_deals.append({
+                "original_url": u,
+                "target_url": target_url,
+                "converted_url": converted_url,
+                "is_amz": is_amz,
+                "store": store,
+            })
+            log.info("Resolved deal %s -> %s (store: %s, is_amz: %s)", u, converted_url, store, is_amz)
+        except Exception as e:
+            log.warning("Failed to convert deal URL %s: %s", u, e)
+
+    return converted_deals
+
+
 def clean_markdown_deal_template(text: str) -> str:
     """Clean markdown template for deal posts:
     - Retains deal emoji/title, discount %, price, and details
@@ -1302,20 +1437,43 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
     amazon_tag = await resolve_user_amazon_tag(user)
     uid = user.user_id or _telegram_to_user_id.get(str(user.telegram_user_id)) or ""
 
-    # 2. Convert deal links using Amazon Direct Tag or Cuelinks and Kamaikaro link shortener
-    if sub_id or amazon_tag:
-        converted, n = await convert_text(text, sub_id=sub_id, user_id=uid, amazon_tag=amazon_tag)
-    else:
-        converted = text
-        n = 0
+    # 2. Extract and convert deal URLs (Amazon tag / Cuelinks)
+    converted_deals = await resolve_and_convert_deals(text, sub_id=sub_id, user_id=uid, amazon_tag=amazon_tag)
 
-    # Clean formatting on final text to avoid split links
-    converted = fix_split_urls(converted)
+    # 3. Clean up caption completely: remove all URLs, Markdown hyperlinks [Buy Now](...),
+    # and CTA lines so caption is 100% clean and users tap the direct inline button without popups.
+    clean_caption = strip_deal_links_and_clean_caption(text)
+    if not clean_caption.strip():
+        clean_caption = "🔥 Special Deal Offer"
 
-    # Clean markdown deal template: cleans spacing, retains emoji/title, discount, price, ends with clean short link
-    converted = clean_markdown_deal_template(converted)
+    # 4. Build prominent inline keyboard button:
+    # Directly uses converted Amazon / store URL so clicking opens the native App directly without popup
+    telethon_buttons = None
+    aiogram_reply_markup = None
+    primary_url = None
 
-    # 3. Resolve user's target channels
+    if converted_deals:
+        # Prioritize Amazon deal if present, otherwise first deal
+        primary_deal = next((d for d in converted_deals if d.get("is_amz")), converted_deals[0])
+        primary_url = primary_deal["converted_url"]
+
+        if primary_deal.get("is_amz") or "amazon" in primary_deal.get("store", "").lower():
+            btn_label = "🛒 BUY NOW ON AMAZON"
+        elif "flipkart" in primary_deal.get("store", "").lower():
+            btn_label = "🛒 BUY NOW ON FLIPKART"
+        elif "myntra" in primary_deal.get("store", "").lower():
+            btn_label = "🛒 BUY NOW ON MYNTRA"
+        elif "ajio" in primary_deal.get("store", "").lower():
+            btn_label = "🛒 BUY NOW ON AJIO"
+        else:
+            btn_label = "🛒 BUY NOW / VIEW DEAL"
+
+        telethon_buttons = [Button.url(btn_label, primary_url)]
+        aiogram_reply_markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=btn_label, url=primary_url)]]
+        )
+
+    # 5. Resolve user's target channels
     targets = []
     if user.target_channel_id:
         targets.append(user.target_channel_id)
@@ -1337,65 +1495,65 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
 
     u_client = await session_mgr.get_client_for_telegram_id(user.telegram_user_id)
 
-    # Standardize markdown link format for clients [Buy Now / View Deal](<url>) -> [Buy Now / View Deal](url)
-    display_content = re.sub(r"\[([^\]]+)\]\(<([^>]+)>\)", r"[\1](\2)", converted)
-
-    # 4. Post to each target channel
+    # 6. Post to each target channel
     for target in targets:
         posted = False
-        # Try Telethon native media sender via user client first
+        # Try Telethon native media sender via user client first with direct inline URL button
         if u_client and u_client.is_connected():
             try:
                 if is_real_media and (getattr(msg, "media", None) or media_path):
                     file_to_send = msg.media if getattr(msg, "media", None) else media_path
-                    if len(display_content) <= CAPTION_LIMIT:
-                        await u_client.send_file(target, file=file_to_send, caption=display_content)
+                    if len(clean_caption) <= CAPTION_LIMIT:
+                        await u_client.send_file(target, file=file_to_send, caption=clean_caption, buttons=telethon_buttons)
                     else:
-                        # If caption exceeds 1024-character limit for media:
-                        # send the photo/media first and immediately send the deal text as follow-up reply
                         sent_media = await u_client.send_file(target, file=file_to_send)
                         reply_id = getattr(sent_media, "id", None)
-                        await u_client.send_message(target, display_content[:MESSAGE_LIMIT], reply_to=reply_id)
+                        await u_client.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_to=reply_id, buttons=telethon_buttons)
                 else:
-                    await u_client.send_message(target, display_content[:MESSAGE_LIMIT])
+                    await u_client.send_message(target, clean_caption[:MESSAGE_LIMIT], buttons=telethon_buttons)
                 posted = True
-                log.info("Posted deal to target %s via user Telethon client for user %s", target, user.user_id)
+                log.info("Posted deal to target %s via user Telethon client for user %s (inline button attached)", target, user.user_id)
             except Exception as client_err:
                 log.warning("User Telethon client posting to %s failed: %s; trying Bot fallback...", target, client_err)
 
-        # Fallback to Aiogram Bot
+        # Fallback to Aiogram Bot with inline keyboard button
         if not posted and bot:
             try:
                 if is_real_media and media_path and os.path.exists(media_path):
                     file_input = FSInputFile(media_path)
-                    if len(display_content) <= CAPTION_LIMIT:
+                    if len(clean_caption) <= CAPTION_LIMIT:
                         try:
-                            await bot.send_photo(target, file_input, caption=display_content, parse_mode=ParseMode.MARKDOWN)
+                            await bot.send_photo(target, file_input, caption=clean_caption, reply_markup=aiogram_reply_markup)
                         except Exception:
-                            try:
-                                await bot.send_photo(target, file_input, caption=display_content, parse_mode=None)
-                            except Exception:
-                                await bot.send_document(target, file_input, caption=display_content, parse_mode=None)
+                            await bot.send_document(target, file_input, caption=clean_caption, reply_markup=aiogram_reply_markup)
                     else:
-                        # Exceeds 1024-char limit: send media first, follow-up with deal text
                         try:
-                            sent = await bot.send_photo(target, file_input, parse_mode=None)
-                            try:
-                                await bot.send_message(target, display_content[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, parse_mode=ParseMode.MARKDOWN)
-                            except Exception:
-                                await bot.send_message(target, display_content[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, parse_mode=None)
+                            sent = await bot.send_photo(target, file_input)
+                            await bot.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, reply_markup=aiogram_reply_markup)
                         except Exception:
-                            sent = await bot.send_document(target, file_input, parse_mode=None)
-                            await bot.send_message(target, display_content[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, parse_mode=None)
+                            sent = await bot.send_document(target, file_input)
+                            await bot.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, reply_markup=aiogram_reply_markup)
                 else:
-                    try:
-                        await bot.send_message(target, display_content[:MESSAGE_LIMIT], parse_mode=ParseMode.MARKDOWN)
-                    except Exception:
-                        await bot.send_message(target, display_content[:MESSAGE_LIMIT], parse_mode=None)
+                    await bot.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_markup=aiogram_reply_markup)
                 posted = True
-                log.info("Posted deal to target %s via Bot for user %s", target, user.user_id)
+                log.info("Posted deal to target %s via Bot for user %s (inline button attached)", target, user.user_id)
             except Exception as bot_err:
                 log.error("Bot posting also failed to %s for user %s: %s", target, user.user_id, bot_err)
+
+        # Fail-safe text fallback: If neither user client with buttons nor Bot could post,
+        # post clean caption with direct link line via user client so the deal is never dropped
+        if not posted and u_client and u_client.is_connected() and primary_url:
+            try:
+                fallback_caption = f"{clean_caption}\n\n🛒 **BUY NOW:** {primary_url}"
+                if is_real_media and (getattr(msg, "media", None) or media_path):
+                    file_to_send = msg.media if getattr(msg, "media", None) else media_path
+                    await u_client.send_file(target, file=file_to_send, caption=fallback_caption[:CAPTION_LIMIT])
+                else:
+                    await u_client.send_message(target, fallback_caption[:MESSAGE_LIMIT])
+                posted = True
+                log.info("Posted deal to target %s via user Telethon client (text link fallback)", target)
+            except Exception as fallback_err:
+                log.error("All posting attempts failed to %s for user %s: %s", target, user.user_id, fallback_err)
 
 
 async def safe_post(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> bool:
