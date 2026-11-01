@@ -958,6 +958,55 @@ def strip_deal_links_and_clean_caption(text: str) -> str:
     return result
 
 
+def format_caption_with_links(clean_caption: str, converted_deals: list[dict[str, Any]]) -> str:
+    """Append clean, prominent clickable link(s) to the caption for Telethon User Client posting,
+    where Telegram API restricts inline buttons to official Bot tokens only.
+    Handles single deals as well as multiple deals cleanly.
+    """
+    if not converted_deals:
+        return clean_caption
+
+    link_lines = []
+    if len(converted_deals) == 1:
+        d = converted_deals[0]
+        url = d.get("converted_url", "")
+        store = d.get("store", "Store")
+        if d.get("is_amz") or "amazon" in store.lower():
+            link_lines.append(f"🛒 Buy on Amazon: {url}")
+        elif "flipkart" in store.lower():
+            link_lines.append(f"🛒 Buy on Flipkart: {url}")
+        elif "myntra" in store.lower():
+            link_lines.append(f"🛍️ Buy on Myntra: {url}")
+        elif "ajio" in store.lower():
+            link_lines.append(f"🛍️ Buy on Ajio: {url}")
+        else:
+            link_lines.append(f"👉 🛒 Buy Now / Grab Deal: {url}")
+    else:
+        # Multiple links handling: list each one cleanly
+        seen_urls = set()
+        for d in converted_deals:
+            url = d.get("converted_url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            store = d.get("store", "Store")
+            if d.get("is_amz") or "amazon" in store.lower():
+                link_lines.append(f"🛒 Buy on Amazon: {url}")
+            elif "flipkart" in store.lower():
+                link_lines.append(f"🛒 Buy on Flipkart: {url}")
+            elif "myntra" in store.lower():
+                link_lines.append(f"🛍️ Buy on Myntra: {url}")
+            elif "ajio" in store.lower():
+                link_lines.append(f"🛍️ Buy on Ajio: {url}")
+            else:
+                link_lines.append(f"🛒 Buy on {store}: {url}")
+
+    links_block = "\n".join(link_lines)
+    if clean_caption.strip():
+        return f"{clean_caption.strip()}\n\n{links_block}"
+    return links_block
+
+
 async def resolve_and_convert_deals(
     text: str,
     sub_id: str,
@@ -1446,34 +1495,32 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
     if not clean_caption.strip():
         clean_caption = "🔥 Special Deal Offer"
 
-    # 4. Build prominent inline keyboard button:
-    # Directly uses converted Amazon / store URL so clicking opens the native App directly without popup
-    telethon_buttons = None
+    # 4. Telethon User Client caption (with clean, prominent clickable links appended)
+    # Telegram MTProto API restricts inline buttons to official Bot tokens only.
+    # When posting via Telethon User Client, we append clean clickable link(s) to the caption so no deal is missing links.
+    user_client_caption = format_caption_with_links(clean_caption, converted_deals)
+
+    # 5. Build official inline keyboard markup for Bot Token delivery
     aiogram_reply_markup = None
-    primary_url = None
-
     if converted_deals:
-        # Prioritize Amazon deal if present, otherwise first deal
-        primary_deal = next((d for d in converted_deals if d.get("is_amz")), converted_deals[0])
-        primary_url = primary_deal["converted_url"]
+        keyboard_rows = []
+        for d in converted_deals:
+            url = d["converted_url"]
+            store = d.get("store", "Store")
+            if d.get("is_amz") or "amazon" in store.lower():
+                btn_text = "🛒 BUY NOW ON AMAZON"
+            elif "flipkart" in store.lower():
+                btn_text = "🛒 BUY NOW ON FLIPKART"
+            elif "myntra" in store.lower():
+                btn_text = "🛍️ BUY NOW ON MYNTRA"
+            elif "ajio" in store.lower():
+                btn_text = "🛍️ BUY NOW ON AJIO"
+            else:
+                btn_text = "🛒 BUY NOW / GRAB DEAL"
+            keyboard_rows.append([InlineKeyboardButton(text=btn_text, url=url)])
+        aiogram_reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
-        if primary_deal.get("is_amz") or "amazon" in primary_deal.get("store", "").lower():
-            btn_label = "🛒 BUY NOW ON AMAZON"
-        elif "flipkart" in primary_deal.get("store", "").lower():
-            btn_label = "🛒 BUY NOW ON FLIPKART"
-        elif "myntra" in primary_deal.get("store", "").lower():
-            btn_label = "🛒 BUY NOW ON MYNTRA"
-        elif "ajio" in primary_deal.get("store", "").lower():
-            btn_label = "🛒 BUY NOW ON AJIO"
-        else:
-            btn_label = "🛒 BUY NOW / VIEW DEAL"
-
-        telethon_buttons = [Button.url(btn_label, primary_url)]
-        aiogram_reply_markup = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text=btn_label, url=primary_url)]]
-        )
-
-    # 5. Resolve user's target channels
+    # 6. Resolve user's target channels
     targets = []
     if user.target_channel_id:
         targets.append(user.target_channel_id)
@@ -1495,29 +1542,16 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
 
     u_client = await session_mgr.get_client_for_telegram_id(user.telegram_user_id)
 
-    # 6. Post to each target channel
+    # 7. Post to each target channel using Dual-Mode Delivery
     for target in targets:
         posted = False
-        # Try Telethon native media sender via user client first with direct inline URL button
-        if u_client and u_client.is_connected():
-            try:
-                if is_real_media and (getattr(msg, "media", None) or media_path):
-                    file_to_send = msg.media if getattr(msg, "media", None) else media_path
-                    if len(clean_caption) <= CAPTION_LIMIT:
-                        await u_client.send_file(target, file=file_to_send, caption=clean_caption, buttons=telethon_buttons)
-                    else:
-                        sent_media = await u_client.send_file(target, file=file_to_send)
-                        reply_id = getattr(sent_media, "id", None)
-                        await u_client.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_to=reply_id, buttons=telethon_buttons)
-                else:
-                    await u_client.send_message(target, clean_caption[:MESSAGE_LIMIT], buttons=telethon_buttons)
-                posted = True
-                log.info("Posted deal to target %s via user Telethon client for user %s (inline button attached)", target, user.user_id)
-            except Exception as client_err:
-                log.warning("User Telethon client posting to %s failed: %s; trying Bot fallback...", target, client_err)
 
-        # Fallback to Aiogram Bot with inline keyboard button
-        if not posted and bot:
+        # ------------------------------------------------------------------- #
+        # MODE 1: Official Bot Token Delivery
+        # (If BOT_TOKEN is available and bot is admin in channel, post with
+        # official Telegram Inline Keyboard Buttons)
+        # ------------------------------------------------------------------- #
+        if bot and BOT_TOKEN:
             try:
                 if is_real_media and media_path and os.path.exists(media_path):
                     file_input = FSInputFile(media_path)
@@ -1536,24 +1570,32 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
                 else:
                     await bot.send_message(target, clean_caption[:MESSAGE_LIMIT], reply_markup=aiogram_reply_markup)
                 posted = True
-                log.info("Posted deal to target %s via Bot for user %s (inline button attached)", target, user.user_id)
+                log.info("Posted deal to target %s via official Bot Token with inline buttons for user %s", target, user.user_id)
             except Exception as bot_err:
-                log.error("Bot posting also failed to %s for user %s: %s", target, user.user_id, bot_err)
+                log.info("Bot Token posting to %s not available or failed (%s); switching to Telethon User Client mode...", target, bot_err)
 
-        # Fail-safe text fallback: If neither user client with buttons nor Bot could post,
-        # post clean caption with direct link line via user client so the deal is never dropped
-        if not posted and u_client and u_client.is_connected() and primary_url:
+        # ------------------------------------------------------------------- #
+        # MODE 2: Telethon User Client Delivery
+        # (Telegram drops inline buttons on user accounts, so we post with
+        # clean, prominent clickable link(s) appended directly in the caption)
+        # ------------------------------------------------------------------- #
+        if not posted and u_client and u_client.is_connected():
             try:
-                fallback_caption = f"{clean_caption}\n\n🛒 **BUY NOW:** {primary_url}"
+                caption_to_send = user_client_caption if converted_deals else clean_caption
                 if is_real_media and (getattr(msg, "media", None) or media_path):
                     file_to_send = msg.media if getattr(msg, "media", None) else media_path
-                    await u_client.send_file(target, file=file_to_send, caption=fallback_caption[:CAPTION_LIMIT])
+                    if len(caption_to_send) <= CAPTION_LIMIT:
+                        await u_client.send_file(target, file=file_to_send, caption=caption_to_send)
+                    else:
+                        sent_media = await u_client.send_file(target, file=file_to_send)
+                        reply_id = getattr(sent_media, "id", None)
+                        await u_client.send_message(target, caption_to_send[:MESSAGE_LIMIT], reply_to=reply_id)
                 else:
-                    await u_client.send_message(target, fallback_caption[:MESSAGE_LIMIT])
+                    await u_client.send_message(target, caption_to_send[:MESSAGE_LIMIT])
                 posted = True
-                log.info("Posted deal to target %s via user Telethon client (text link fallback)", target)
-            except Exception as fallback_err:
-                log.error("All posting attempts failed to %s for user %s: %s", target, user.user_id, fallback_err)
+                log.info("Posted deal to target %s via Telethon User Client with clean clickable links for user %s", target, user.user_id)
+            except Exception as client_err:
+                log.error("Telethon User Client posting also failed to %s for user %s: %s", target, user.user_id, client_err)
 
 
 async def safe_post(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> bool:
