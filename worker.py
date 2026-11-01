@@ -39,9 +39,14 @@ from aiogram.types import (
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import (
+    ApiIdInvalidError,
+    FloodWaitError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
+    PhoneNumberBannedError,
+    PhoneNumberFloodError,
+    PhoneNumberInvalidError,
     SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
@@ -68,6 +73,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
 )
 log = logging.getLogger("worker")
+logger = log
 
 VERIFY_URL = f"{BASE_WEB_URL}/api/telegram/verify-sync"
 CONFIG_URL = f"{BASE_WEB_URL}/api/telegram/user-config"
@@ -1799,16 +1805,92 @@ async def process_phone(message: Message, state: FSMContext) -> None:
         retry_delay=1,
         timeout=30,
     )
-    await client.connect()
     try:
-        req = await client.send_code_request(phone)
-    except Exception as e:
-        log.warning("send_code_request error for %s: %s", phone, e)
+        await client.connect()
+    except Exception as conn_err:
+        logger.error(f"Failed to send code: {conn_err}")
         try:
             await client.disconnect()
         except Exception:
             pass
-        await message.answer(f"❌ Failed to send code from Telegram: {e}\n\nPlease try again with /login.")
+        await message.answer(f"❌ Failed to connect to Telegram servers: {conn_err}\n\nPlease try again with /login.")
+        await state.clear()
+        return
+
+    try:
+        req = await client.send_code_request(phone)
+    except FloodWaitError as e:
+        logger.error(f"Failed to send code: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        wait_seconds = getattr(e, "seconds", 0)
+        minutes = math.ceil(wait_seconds / 60) if wait_seconds else 0
+        wait_msg = f"\n\n⏳ <b>Wait duration:</b> {wait_seconds} seconds (~{minutes} min)" if wait_seconds else ""
+        await message.answer(
+            f"⏳ <b>Telegram Rate Limit (FloodWaitError):</b>\n\n"
+            f"<code>{e}</code>{wait_msg}\n\n"
+            "Telegram has rate-limited login requests for this account. Please wait for the cooldown to expire before trying /login again."
+        )
+        await state.clear()
+        return
+    except PhoneNumberFloodError as e:
+        logger.error(f"Failed to send code: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.answer(
+            f"🚫 <b>Telegram Limit (PhoneNumberFloodError):</b>\n\n"
+            f"<code>{e}</code>\n\n"
+            "Too many requests have been made for this phone number. Telegram has temporarily rate-limited login attempts. Please wait some time before trying /login again."
+        )
+        await state.clear()
+        return
+    except ApiIdInvalidError as e:
+        logger.error(f"Failed to send code: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.answer(
+            f"❌ <b>API Configuration Error (ApiIdInvalidError):</b>\n\n"
+            f"<code>{e}</code>\n\n"
+            "The configured TELEGRAM_API_ID or TELEGRAM_API_HASH is invalid. Please check your credentials."
+        )
+        await state.clear()
+        return
+    except (PhoneNumberInvalidError, PhoneNumberBannedError) as e:
+        logger.error(f"Failed to send code: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.answer(
+            f"❌ <b>Phone Number Error:</b>\n\n"
+            f"<code>{e}</code>\n\n"
+            "Please verify your international country code format (e.g. <code>+919876543210</code>) and try again with /login."
+        )
+        await state.clear()
+        return
+    except Exception as e:
+        logger.error(f"Failed to send code: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        wait_text = ""
+        wait_match = re.search(r"wait of (\d+) seconds", str(e), re.I) or re.search(r"(\d+) seconds", str(e), re.I)
+        if wait_match:
+            secs = int(wait_match.group(1))
+            wait_text = f"\n\n⏳ <b>Wait duration:</b> {secs} seconds (~{math.ceil(secs / 60)} minutes)"
+
+        await message.answer(
+            f"❌ <b>Failed to send verification code:</b>\n\n"
+            f"<code>{e}</code>{wait_text}\n\n"
+            "Please try again with /login."
+        )
         await state.clear()
         return
 
