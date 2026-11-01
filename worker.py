@@ -36,6 +36,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
@@ -80,6 +81,7 @@ VERIFY_URL = f"{BASE_WEB_URL}/api/telegram/verify-sync"
 CONFIG_URL = f"{BASE_WEB_URL}/api/telegram/user-config"
 SAVE_SESSION_URL = f"{BASE_WEB_URL}/api/telegram/save-session"
 CHANNELS_URL = f"{BASE_WEB_URL}/api/telegram/channels"
+REDIRECT_APP_BASE = os.getenv("REDIRECT_APP_BASE", "https://www.kamaikaro.in").rstrip("/")
 
 SHORTENER_DOMAINS = (
     "amazn.lt", "amzn.to", "amzn.in", "amzn.cl", "amzn.eu", "a.co",
@@ -1007,6 +1009,33 @@ def format_caption_with_links(clean_caption: str, converted_deals: list[dict[str
     return links_block
 
 
+def get_redirect_launcher_url(target_url: str) -> str:
+    """Construct Telegram WebApp launcher URL that opens target affiliate link
+    via window.Telegram.WebApp.openLink(), eliminating the native OS/Telegram 'Open link?'
+    confirmation dialog and launching the native store app directly.
+    """
+    encoded = quote(target_url, safe="")
+    return f"{REDIRECT_APP_BASE}/api/redirect-app?url={encoded}"
+
+
+def make_aiogram_deal_button(btn_text: str, url: str) -> InlineKeyboardButton:
+    """Create an Aiogram WebApp button pointing to the instant redirect launcher."""
+    launcher_url = get_redirect_launcher_url(url)
+    return InlineKeyboardButton(text=btn_text, web_app=WebAppInfo(url=launcher_url))
+
+
+def make_telethon_deal_button(btn_text: str, url: str) -> Any:
+    """Create a Telethon WebApp button pointing to the instant redirect launcher."""
+    launcher_url = get_redirect_launcher_url(url)
+    if hasattr(Button, "web_app"):
+        return getattr(Button, "web_app")(btn_text, launcher_url)
+    try:
+        from telethon.tl.types import KeyboardInlineButton, InlineButtonTypeWebView
+        return KeyboardInlineButton(text=btn_text, type=InlineButtonTypeWebView(url=launcher_url))
+    except Exception:
+        return Button.url(btn_text, launcher_url)
+
+
 async def resolve_and_convert_deals(
     text: str,
     sub_id: str,
@@ -1517,7 +1546,7 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
                 btn_text = "🛍️ BUY NOW ON AJIO"
             else:
                 btn_text = "🛒 BUY NOW / GRAB DEAL"
-            keyboard_rows.append([InlineKeyboardButton(text=btn_text, url=url)])
+            keyboard_rows.append([make_aiogram_deal_button(btn_text, url)])
         aiogram_reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
     # 6. Resolve user's target channels
