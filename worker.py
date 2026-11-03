@@ -20,7 +20,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Any
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+import urllib.parse
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlparse, urlunparse
 
 import aiohttp
 from aiohttp import web
@@ -1343,6 +1344,22 @@ def get_deal_button_label(store: str = "", is_amz: bool = False, url: str = "") 
     return "⚡ BUY NOW / LOOT DEAL"
 
 
+def wrap_fast_redirect_url(target_url: str, user_sub_id: str = "") -> str:
+    """Wrap outgoing affiliate links inside https://kamaikaro.in/api/r
+    so clicks are instantly counted in real-time before redirecting to the merchant,
+    WITHOUT breaking any existing link parameters, SubIDs, or layout.
+    """
+    clean_target = clean_url_formatting(target_url)
+    if not clean_target:
+        return target_url
+    if "kamaikaro.in/api/r?url=" in clean_target:
+        return clean_target
+    encoded = urllib.parse.quote_plus(clean_target)
+    if user_sub_id:
+        return f"https://kamaikaro.in/api/r?url={encoded}&subid={user_sub_id}"
+    return f"https://kamaikaro.in/api/r?url={encoded}"
+
+
 def make_aiogram_deal_button(btn_text: str, url: str) -> InlineKeyboardButton:
     """Create a channel-supported native URL inline button for Aiogram Bot."""
     return InlineKeyboardButton(text=btn_text, url=url)
@@ -2197,13 +2214,18 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
     telethon_buttons = []
     if converted_deals:
         keyboard_rows = []
+        user_sub_id = compact_sub_id or getattr(user, "tracking_sub_id", "") or uid
         for d in converted_deals:
-            url = d["converted_url"]
+            target_url = d["converted_url"]
             store = d.get("store", "Store")
             is_amz = bool(d.get("is_amz"))
-            btn_text = d.get("btn_label") or get_deal_button_label(store=store, is_amz=is_amz, url=url)
-            keyboard_rows.append([make_aiogram_deal_button(btn_text, url)])
-            telethon_buttons.append([make_telethon_deal_button(btn_text, url)])
+            btn_text = d.get("btn_label") or get_deal_button_label(store=store, is_amz=is_amz, url=target_url)
+
+            # Fast-Redirect URL wrapper for real-time click counting: https://kamaikaro.in/api/r
+            button_url = f"https://kamaikaro.in/api/r?url={urllib.parse.quote_plus(target_url)}&subid={user_sub_id}"
+
+            keyboard_rows.append([make_aiogram_deal_button(btn_text, button_url)])
+            telethon_buttons.append([make_telethon_deal_button(btn_text, button_url)])
         aiogram_reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
     # 5. Resolve user's target channels
@@ -3976,8 +3998,9 @@ async def handle_user_incoming_url(message: Message, state: FSMContext = None) -
             "store": store,
             "is_amz": is_amz,
         })
+        button_url = f"https://kamaikaro.in/api/r?url={urllib.parse.quote_plus(converted_url)}&subid={user_sub_id}"
         links_text_lines.append(f"👉 <b>{store}:</b> {final_link}")
-        buttons.append([InlineKeyboardButton(text=btn_text, url=final_link)])
+        buttons.append([InlineKeyboardButton(text=btn_text, url=button_url)])
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
