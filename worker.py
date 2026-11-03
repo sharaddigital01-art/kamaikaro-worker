@@ -68,6 +68,10 @@ CUELINKS_CHNL_ID = os.getenv("CUELINKS_CHNL_ID", "332862").strip()
 SYNC_INTERVAL = int(os.getenv("CONFIG_SYNC_INTERVAL", "60"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 PORT = int(os.getenv("PORT", "8080"))
+AMAZON_ASSOCIATE_TAG = os.getenv("AMAZON_ASSOCIATE_TAG", "kamaikaro02-21").strip() or "kamaikaro02-21"
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "00000000-0000-0000-0000-000000000000").strip() or "00000000-0000-0000-0000-000000000000"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_KEY", "")).strip()
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -359,7 +363,15 @@ _session: Optional[aiohttp.ClientSession] = None
 
 async def http() -> aiohttp.ClientSession:
     global _session
-    if _session is None or _session.closed:
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if _session is not None and (_session.closed or getattr(_session, "_loop", None) is not current_loop):
+        _session = None
+
+    if _session is None:
         headers = {
             "User-Agent": "kamai-telegram-worker/2.0",
             "x-worker-secret": WORKER_API_SECRET,
@@ -564,8 +576,10 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
         )
 
         parsed_amazon_tag = clean_amazon_associate_tag(str(
-            raw.get("amazonTag")
+            raw.get("customAmazonTag")
+            or raw.get("amazonTag")
             or raw.get("amazon_tag")
+            or (raw.get("user") or {}).get("customAmazonTag")
             or (raw.get("user") or {}).get("amazonTag")
             or (raw.get("user") or {}).get("amazon_tag")
             or ""
@@ -756,36 +770,56 @@ def is_amazon_url(url: str) -> bool:
         return False
 
 
-def to_amazon_affiliate_url(url: str, amazon_tag: str, fallback_url: Optional[str] = None) -> str:
-    """Generate clean direct Amazon affiliate URL:
-    https://www.amazon.in/dp/{asin}?tag={user_amazon_tag}
-    Strip out all extra ref, session, and tracking clutter.
-    Preserves exact unbroken single-line URL formatting.
+def build_intelligent_amazon_url(
+    url: str,
+    custom_amazon_tag: Optional[str] = None,
+    user_id: Optional[str] = None,
+    fallback_url: Optional[str] = None,
+) -> str:
+    """Intelligent Amazon Link Builder:
+    IF customAmazonTag exists and is non-empty:
+      Format URL: ${cleanUrl}?tag=${customAmazonTag}
+    ELSE:
+      Format URL: ${cleanUrl}?tag=${AMAZON_ASSOCIATE_TAG || 'kamaikaro02-21'}&ascsubtag=${userId}
     """
-    clean_tag = clean_amazon_associate_tag(amazon_tag)
-    if not clean_tag:
-        return clean_url_formatting(url)
-
+    clean_tag = clean_amazon_associate_tag(custom_amazon_tag or "")
     asin = extract_amazon_asin(url) or (extract_amazon_asin(fallback_url) if fallback_url else None)
+
+    if clean_tag:
+        if asin:
+            return clean_url_formatting(f"https://www.amazon.in/dp/{asin}?tag={clean_tag}")
+        clean = strip_affiliate_params(clean_url_formatting(url))
+        p = urlparse(clean)
+        domain = "www.amazon.in" if "amazon" in p.netloc.lower() else (p.netloc or "www.amazon.in")
+        clean_path = re.sub(r"/ref=[^/?#]+", "", p.path)
+        return clean_url_formatting(f"https://{domain}{clean_path}?tag={clean_tag}")
+
+    # Fallback to Master Tag with user tracking ascsubtag
+    master_tag = clean_amazon_associate_tag(AMAZON_ASSOCIATE_TAG) or "kamaikaro02-21"
+    sub_id = user_id or ADMIN_USER_ID
     if asin:
-        return clean_url_formatting(f"https://www.amazon.in/dp/{asin}?tag={clean_tag}")
+        return clean_url_formatting(f"https://www.amazon.in/dp/{asin}?tag={master_tag}&ascsubtag={sub_id}")
 
     clean = strip_affiliate_params(clean_url_formatting(url))
     p = urlparse(clean)
-    clutter_keys = {
-        "tag", "tag_id", "ascsubtag", "linkcode", "ref", "ref_",
-        "pf_rd_r", "pf_rd_m", "pf_rd_s", "pf_rd_t", "pf_rd_i", "pf_rd_p",
-        "pd_rd_r", "pd_rd_w", "pd_rd_wg", "qid", "sr", "crid", "sprefix",
-        "creative", "camp", "creativeasin", "source", "share_tag",
-    }
-    q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-         if k.lower() not in clutter_keys and not k.lower().startswith("ref")]
-    q.append(("tag", clean_tag))
+    domain = "www.amazon.in" if "amazon" in p.netloc.lower() else (p.netloc or "www.amazon.in")
     clean_path = re.sub(r"/ref=[^/?#]+", "", p.path)
-    domain = p.netloc.lower().split(":")[0] if p.netloc else "www.amazon.in"
-    if "amazon" in domain:
-        domain = "www.amazon.in"
-    return clean_url_formatting(urlunparse(p._replace(netloc=domain, path=clean_path, query=urlencode(q))))
+    return clean_url_formatting(f"https://{domain}{clean_path}?tag={master_tag}&ascsubtag={sub_id}")
+
+
+def to_amazon_affiliate_url(
+    url: str,
+    amazon_tag: Optional[str] = None,
+    fallback_url: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> str:
+    """Generate clean direct Amazon affiliate URL using the Intelligent Link Builder."""
+    return build_intelligent_amazon_url(
+        url=url,
+        custom_amazon_tag=amazon_tag,
+        user_id=user_id,
+        fallback_url=fallback_url,
+    )
 
 
 async def api_shorten_link(
@@ -1083,14 +1117,20 @@ async def resolve_and_convert_deals(
             clean_url = strip_affiliate_params(target_url)
             is_amz = is_amazon_url(target_url) or is_amazon_url(u)
 
-            if is_amz and amazon_tag:
-                converted_url = clean_url_formatting(to_amazon_affiliate_url(target_url, amazon_tag, fallback_url=u))
+            effective_user_id = user_id or sub_id or ADMIN_USER_ID
+
+            if is_amz:
+                converted_url = clean_url_formatting(
+                    build_intelligent_amazon_url(
+                        target_url,
+                        custom_amazon_tag=amazon_tag,
+                        user_id=effective_user_id,
+                        fallback_url=u,
+                    )
+                )
                 store = "Amazon"
-            elif is_amz and sub_id:
-                converted_url = clean_url_formatting(to_cuelinks(clean_url, sub_id))
-                store = "Amazon"
-            elif sub_id:
-                converted_url = clean_url_formatting(to_cuelinks(clean_url, sub_id))
+            else:
+                converted_url = clean_url_formatting(to_cuelinks(clean_url, effective_user_id))
                 if any(h in clean_url for h in ("flipkart", "fkrt")):
                     store = "Flipkart"
                 elif any(h in clean_url for h in ("myntra", "myntr")):
@@ -1099,12 +1139,6 @@ async def resolve_and_convert_deals(
                     store = "Ajio"
                 else:
                     store = "Deal"
-            elif is_amz:
-                converted_url = clean_url_formatting(clean_url)
-                store = "Amazon"
-            else:
-                converted_url = clean_url_formatting(clean_url)
-                store = "Deal"
 
             converted_deals.append({
                 "original_url": u,
@@ -1216,13 +1250,20 @@ async def convert_text(
             clean_url = strip_affiliate_params(target_url)
             is_amz = is_amazon_url(target_url) or is_amazon_url(u)
 
+            effective_user_id = user_id or sub_id or ADMIN_USER_ID
+
             # Determine the converted affiliate destination URL
-            if is_amz and amazon_tag:
-                converted_url = clean_url_formatting(to_amazon_affiliate_url(target_url, amazon_tag, fallback_url=u))
-            elif sub_id:
-                converted_url = clean_url_formatting(to_cuelinks(clean_url, sub_id))
+            if is_amz:
+                converted_url = clean_url_formatting(
+                    build_intelligent_amazon_url(
+                        target_url,
+                        custom_amazon_tag=amazon_tag,
+                        user_id=effective_user_id,
+                        fallback_url=u,
+                    )
+                )
             else:
-                converted_url = clean_url_formatting(clean_url)
+                converted_url = clean_url_formatting(to_cuelinks(clean_url, effective_user_id))
 
             # Mandatory short URL conversion via API route:
             # POST https://www.kamaikaro.in/api/links/shorten
@@ -1316,8 +1357,10 @@ async def resolve_user_amazon_tag(user: UserConfig) -> str:
             configs = await api_fetch_configs(user_id=user.user_id)
             if configs:
                 raw_tag = str(
-                    configs[0].get("amazonTag")
+                    configs[0].get("customAmazonTag")
+                    or configs[0].get("amazonTag")
                     or configs[0].get("amazon_tag")
+                    or (configs[0].get("user") or {}).get("customAmazonTag")
                     or (configs[0].get("user") or {}).get("amazonTag")
                     or (configs[0].get("user") or {}).get("amazon_tag")
                     or ""
@@ -1335,8 +1378,10 @@ async def resolve_user_amazon_tag(user: UserConfig) -> str:
             configs = await api_fetch_configs(telegram_id=user.telegram_user_id)
             if configs:
                 raw_tag = str(
-                    configs[0].get("amazonTag")
+                    configs[0].get("customAmazonTag")
+                    or configs[0].get("amazonTag")
                     or configs[0].get("amazon_tag")
+                    or (configs[0].get("user") or {}).get("customAmazonTag")
                     or (configs[0].get("user") or {}).get("amazonTag")
                     or (configs[0].get("user") or {}).get("amazon_tag")
                     or ""
@@ -1349,6 +1394,97 @@ async def resolve_user_amazon_tag(user: UserConfig) -> str:
             log.warning("Dynamic amazon_tag fetch by telegramId %s failed: %s", user.telegram_user_id, e)
 
     return tag or ""
+
+
+async def fetch_user_context(telegram_chat_id: int | str) -> dict[str, Any]:
+    """Fetch user profile from Supabase/PostgreSQL using telegram_chat_id.
+    Retrieves:
+      - userId
+      - customAmazonTag (if user saved their own Amazon tag in settings)
+    Falls back gracefully to ADMIN_USER_ID for public channels or non-registered users.
+    """
+    s_id = str(telegram_chat_id).strip()
+    if not s_id:
+        return {
+            "userId": ADMIN_USER_ID,
+            "customAmazonTag": None,
+            "isRegistered": False,
+        }
+
+    # 1. In-memory / cache lookup
+    cached_user = store.get_by_telegram_id(s_id)
+    cached_uid = _telegram_to_user_id.get(s_id) or (cached_user.user_id if cached_user else None)
+    cached_tag = _telegram_to_amazon_tag.get(s_id) or (cached_user.amazon_tag if cached_user else None)
+
+    if cached_uid:
+        clean_tag = clean_amazon_associate_tag(cached_tag or "")
+        return {
+            "userId": cached_uid,
+            "customAmazonTag": clean_tag or None,
+            "isRegistered": True,
+        }
+
+    # 2. Supabase PostgREST direct lookup (if SUPABASE_URL & KEY configured)
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        try:
+            s = await http()
+            headers = {
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            }
+            url = f"{SUPABASE_URL}/rest/v1/TelegramChannelConfig?telegramUserId=eq.{s_id}&select=userId,amazonTag,isActive"
+            timeout = aiohttp.ClientTimeout(total=4.0)
+            async with s.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status == 200:
+                    rows = await resp.json()
+                    if rows and isinstance(rows, list) and len(rows) > 0:
+                        first = rows[0]
+                        uid = first.get("userId")
+                        tag = clean_amazon_associate_tag(first.get("amazonTag") or "")
+                        if uid:
+                            _telegram_to_user_id[s_id] = str(uid)
+                            if tag:
+                                _telegram_to_amazon_tag[s_id] = tag
+                            return {
+                                "userId": str(uid),
+                                "customAmazonTag": tag or None,
+                                "isRegistered": True,
+                            }
+        except Exception as sb_err:
+            log.debug("Direct Supabase lookup for %s failed: %s", s_id, sb_err)
+
+    # 3. Dynamic lookup via backend API (/api/telegram/user-config)
+    try:
+        configs = await api_fetch_configs(telegram_id=s_id)
+        if configs and isinstance(configs, list) and len(configs) > 0:
+            first = configs[0]
+            uid = first.get("userId") or (first.get("user") or {}).get("id")
+            tag = clean_amazon_associate_tag(
+                first.get("customAmazonTag")
+                or first.get("amazonTag")
+                or (first.get("user") or {}).get("customAmazonTag")
+                or (first.get("user") or {}).get("amazonTag")
+                or ""
+            )
+            if uid:
+                _telegram_to_user_id[s_id] = str(uid)
+                if tag:
+                    _telegram_to_amazon_tag[s_id] = tag
+                return {
+                    "userId": str(uid),
+                    "customAmazonTag": tag or None,
+                    "isRegistered": True,
+                }
+    except Exception as api_err:
+        log.warning("User-config API lookup for %s failed: %s", s_id, api_err)
+
+    # 4. Fallback for Public Channel / Non-Registered
+    return {
+        "userId": ADMIN_USER_ID,
+        "customAmazonTag": None,
+        "isRegistered": False,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1643,7 +1779,9 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
     # 1. Strictly resolve active user's SubID and Amazon Associate Tag from memory/state or database
     sub_id = await resolve_user_sub_id(user)
     amazon_tag = await resolve_user_amazon_tag(user)
-    uid = user.user_id or _telegram_to_user_id.get(str(user.telegram_user_id)) or ""
+    uid = user.user_id or _telegram_to_user_id.get(str(user.telegram_user_id)) or ADMIN_USER_ID
+    if not sub_id:
+        sub_id = uid or ADMIN_USER_ID
 
     # 2. Extract and convert deal URLs (Amazon tag / Cuelinks)
     converted_deals = await resolve_and_convert_deals(text, sub_id=sub_id, user_id=uid, amazon_tag=amazon_tag)
@@ -3160,6 +3298,136 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT, parse_mode="HTML")
+
+
+@router.message(F.text)
+async def handle_user_incoming_url(message: Message, state: FSMContext = None) -> None:
+    """When a user sends a URL via Telegram:
+    1. User Context Lookup:
+       - Fetch profile from Supabase/PostgreSQL using telegram_chat_id.
+       - Retrieve userId & customAmazonTag (if saved in settings).
+    2. Intelligent Amazon Link Builder:
+       - IF URL is Amazon:
+         - IF customAmazonTag exists and is non-empty:
+           Format URL: ${cleanUrl}?tag=${customAmazonTag}
+         - ELSE:
+           Format URL: ${cleanUrl}?tag=${AMAZON_ASSOCIATE_TAG || 'kamaikaro02-21'}&ascsubtag=${userId}
+       - ELSE (Other stores):
+         - Format URL via Cuelinks API with subid=${userId}.
+    3. Fallback for Public Channel / Non-Registered:
+       - If message is from the broadcast channel or non-registered user, use ADMIN_USER_ID as default subid.
+    """
+    if state:
+        current_state = await state.get_state()
+        if current_state is not None:
+            return
+
+    raw_text = (message.text or "").strip()
+    if not raw_text or raw_text.startswith("/"):
+        return
+
+    urls = extract_deal_urls(raw_text)
+    if not urls:
+        return
+
+    # 1. User Context Lookup using telegram_chat_id
+    telegram_chat_id = message.chat.id
+    sender_id = message.from_user.id if message.from_user else telegram_chat_id
+    user_ctx = await fetch_user_context(sender_id)
+    user_id = user_ctx.get("userId") or ADMIN_USER_ID
+    custom_amazon_tag = user_ctx.get("customAmazonTag")
+    is_registered = user_ctx.get("isRegistered", False)
+
+    # 2. Intelligent Link Builder
+    converted_deals = []
+    buttons = []
+    links_text_lines = []
+
+    for u in urls:
+        target_url = u
+        if is_shortened_url(u):
+            try:
+                target_url = await asyncio.wait_for(unshorten_url(u), timeout=4.0)
+            except Exception:
+                target_url = u
+
+        clean_url = strip_affiliate_params(target_url)
+        is_amz = is_amazon_url(target_url) or is_amazon_url(u)
+
+        if is_amz:
+            converted_url = clean_url_formatting(
+                build_intelligent_amazon_url(
+                    target_url,
+                    custom_amazon_tag=custom_amazon_tag,
+                    user_id=user_id,
+                    fallback_url=u,
+                )
+            )
+            store = "Amazon"
+            btn_text = "🛒 BUY NOW ON AMAZON"
+        else:
+            converted_url = clean_url_formatting(to_cuelinks(clean_url, user_id))
+            store = "Store"
+            if any(h in clean_url for h in ("flipkart", "fkrt")):
+                store = "Flipkart"
+                btn_text = "🛍️ BUY ON FLIPKART"
+            elif any(h in clean_url for h in ("myntra", "myntr")):
+                store = "Myntra"
+                btn_text = "🛍️ BUY ON MYNTRA"
+            elif "ajio" in clean_url:
+                store = "Ajio"
+                btn_text = "🛍️ BUY ON AJIO"
+            else:
+                btn_text = "🛒 BUY NOW / GRAB DEAL"
+
+        # Shorten link via internal API if possible
+        short_url = None
+        if not is_amz or not custom_amazon_tag:
+            try:
+                short_url = await api_shorten_link(converted_url, user_id=user_id, sub_id=user_id)
+            except Exception:
+                short_url = None
+
+        final_link = short_url or converted_url
+        converted_deals.append({
+            "original": u,
+            "converted": converted_url,
+            "final": final_link,
+            "store": store,
+            "is_amz": is_amz,
+        })
+        links_text_lines.append(f"👉 <b>{store}:</b> {final_link}")
+        buttons.append([InlineKeyboardButton(text=btn_text, url=final_link)])
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+    # 3. Response Formatting
+    msg_lines = [
+        "✅ <b>Your Monetized Deal Link is Ready!</b>",
+        "",
+        *links_text_lines,
+    ]
+
+    has_amz = any(d["is_amz"] for d in converted_deals)
+    if has_amz and custom_amazon_tag:
+        msg_lines.append(f"\n🏷️ <i>Applied your custom Amazon tag: <code>{custom_amazon_tag}</code></i>")
+    elif has_amz:
+        msg_lines.append(f"\n🏷️ <i>Applied Master Amazon Tag with subid: <code>{user_id}</code></i>")
+    else:
+        msg_lines.append(f"\n🏷️ <i>Tracking SubID: <code>{user_id}</code></i>")
+
+    if not is_registered:
+        msg_lines.append(
+            "\n💡 <i>Tip: Your Telegram account is not yet connected to a KamaiKaro user account. "
+            "Links are generated using default admin settings. Use /start to link your account and earn commissions!</i>"
+        )
+
+    await message.reply(
+        "\n".join(msg_lines),
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
