@@ -167,9 +167,10 @@ class TTLCache:
         return len(self._cache)
 
 
-# 2-Hour TTL deal deduplication cache
-recent_deal_cache = TTLCache(maxsize=1000, ttl=7200.0)
+# 2-Hour TTL deal deduplication cache (Per-User Composite Keys)
+recent_deal_cache = TTLCache(maxsize=10000, ttl=7200.0)
 _seen_posts = recent_deal_cache._cache  # backwards-compatible mapping
+_in_flight_deals: set[str] = set()
 
 
 def normalize_deal_target(url: str) -> str:
@@ -272,6 +273,10 @@ class UserConfig:
     tracking_sub_id: str = ""
     amazon_tag: str = ""
     is_active: bool = True
+
+    @property
+    def id(self) -> str:
+        return self.user_id
 
 
 def canonical_channel_ids(val: Any) -> set[Any]:
@@ -2330,18 +2335,6 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
             log.debug("No active subscribers found for incoming channel keys: %s", list(incoming_keys)[:5])
             return
 
-        # ------------------------------------------------------------------- #
-        # Strict Duplicate Prevention (Deduplication) - 2 Hours TTL
-        # 1. Source Message Level Deduplication
-        # ------------------------------------------------------------------- #
-        msg_fp = None
-        if chat_id is not None and msg_id is not None:
-            msg_fp = get_deal_fingerprint(f"msg:{chat_id}:{msg_id}")
-            if msg_fp in recent_deal_cache:
-                log.info("Duplicate post detected via source message ID %s:%s; skipping broadcast", chat_id, msg_id)
-                return
-            recent_deal_cache.add(msg_fp)
-
         raw_text = msg.message or ""
         display_text = fix_split_urls(raw_text)
 
@@ -2377,30 +2370,6 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
             except Exception as unshort_batch_err:
                 log.warning("Parallel unshorten batch timed out: %s", unshort_batch_err)
 
-        # ------------------------------------------------------------------- #
-        # 2. Destination Product URL Fingerprint Deduplication (2 Hours TTL)
-        # ------------------------------------------------------------------- #
-        deal_fps = []
-        for u in deal_urls:
-            target_url = u
-            if is_shortened_url(u):
-                try:
-                    target_url = await asyncio.wait_for(unshorten_url(u), timeout=2.0)
-                except Exception:
-                    target_url = u
-            norm_target = normalize_deal_target(target_url)
-            deal_fp = get_deal_fingerprint(f"deal:{norm_target}")
-            if deal_fp in recent_deal_cache:
-                log.info("Duplicate deal detected via fingerprint %s (%s); completely skipping target channel post", deal_fp[:12], norm_target)
-                return
-            deal_fps.append(deal_fp)
-
-        # Record unique fingerprints in cache (2-hour TTL)
-        if msg_fp:
-            recent_deal_cache.add(msg_fp)
-        for dfp in deal_fps:
-            recent_deal_cache.add(dfp)
-
         # Download media to disk for bot fallback if real media is present
         media_path = None
         if is_real_media:
@@ -2417,26 +2386,43 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
         )
 
         # ------------------------------------------------------------------- #
-        # Multi-Tenant Independent User Broadcast Loop
+        # Multi-Tenant Independent User Broadcast Loop with Per-User Deduplication
         # ------------------------------------------------------------------- #
         delivered_count = 0
         try:
             for u in subscribed_users:
+                uid = str(getattr(u, "id", None) or getattr(u, "user_id", None) or getattr(u, "telegram_user_id", None) or "").strip()
+                if not uid:
+                    continue
+
+                # Per-User Deduplication Key: f"{user.id}_{event.chat_id}_{message.id}"
+                cache_key = f"{uid}_{chat_id}_{msg_id}"
+                if cache_key in recent_deal_cache or cache_key in _in_flight_deals:
+                    log.info(
+                        "Skipping duplicate message %s from %s for user %s (already processed for this user)",
+                        msg_id, chat_id, uid
+                    )
+                    continue
+
+                _in_flight_deals.add(cache_key)
                 user_target = u.target_channel_id or (u.target_channels[0] if u.target_channels else "unknown")
                 try:
-                    log.info("Dispatching deal to user %s (target: %s)...", u.user_id, user_target)
+                    log.info("Dispatching deal to user %s (target: %s)...", uid, user_target)
                     success = await post_to_user(bot, u, display_text, msg, media_path)
                     if success:
                         delivered_count += 1
-                        log.info(f"[DISPATCH SUCCESS] Sent deal to user {u.user_id} target channel {user_target}")
+                        recent_deal_cache.add(cache_key)
+                        log.info(f"[DISPATCH SUCCESS] Sent deal to user {uid} target channel {user_target}")
                     else:
-                        log.error(f"[DISPATCH ERROR] Failed for user {u.user_id}: Delivery returned False for target channel {user_target}")
+                        log.error(f"[DISPATCH ERROR] Failed for user {uid}: Delivery returned False for target channel {user_target}")
                 except Exception as user_err:
                     log.error(
-                        f"[DISPATCH ERROR] Failed for user {getattr(u, 'user_id', 'unknown')}: {user_err}",
+                        f"[DISPATCH ERROR] Failed for user {uid}: {user_err}",
                         exc_info=True,
                     )
                     continue
+                finally:
+                    _in_flight_deals.discard(cache_key)
 
             log.info("Deal broadcast complete: %d/%d users successfully received post", delivered_count, len(subscribed_users))
         finally:
