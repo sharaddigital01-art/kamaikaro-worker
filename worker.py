@@ -18,6 +18,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
@@ -79,6 +80,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("worker")
 logger = log
+global_bot: Optional[Bot] = None
 
 VERIFY_URL = f"{BASE_WEB_URL}/api/telegram/verify-sync"
 CONFIG_URL = f"{BASE_WEB_URL}/api/telegram/user-config"
@@ -272,70 +274,90 @@ class UserConfig:
     is_active: bool = True
 
 
-def normalize_channel_variants(val: Any) -> set[str]:
-    """Return all normalized representation variants for a channel ID, username, or URL.
-    Handles int, str, dict (with id/username/title), and URL formats.
+def canonical_channel_ids(val: Any) -> set[Any]:
+    """Convert channel ID/reference to canonical representations:
+    - Raw integer without -100 prefix (e.g. 1234567890)
+    - Full integer with -100 prefix (e.g. -1001234567890)
+    - Canonical string with -100 (e.g. "-1001234567890")
+    - Canonical string without -100 (e.g. "1234567890")
+    - Canonical username string (e.g. "lootdeals")
     """
-    variants: set[str] = set()
+    ids: set[Any] = set()
     if val is None:
-        return variants
+        return ids
 
     if isinstance(val, dict):
         for k in ("id", "channelId", "channel_id", "chat_id", "username", "value"):
             v = val.get(k)
             if v is not None:
-                variants.update(normalize_channel_variants(v))
-        return variants
+                ids.update(canonical_channel_ids(v))
+        return ids
+
+    if isinstance(val, (list, tuple, set)):
+        for item in val:
+            ids.update(canonical_channel_ids(item))
+        return ids
 
     s = str(val).strip()
     if not s:
-        return variants
+        return ids
 
     # Strip URL formatting (https://t.me/...)
     clean_s = re.sub(r"^https?://(?:www\.)?t\.me/", "", s, flags=re.I)
     clean_s = clean_s.split("/")[0].split("?")[0].strip()
 
-    # Lowercase username variants
+    # Username string
     uname = clean_s.lstrip("@").strip().lower()
     if uname:
-        variants.add(uname)
-        variants.add(f"@{uname}")
+        ids.add(uname)
+        ids.add(f"@{uname}")
 
-    # Numeric ID variants (Telegram channel IDs often start with -100 or - or raw digits)
+    # Numeric check
     num_str = clean_s.lstrip("@")
     if re.fullmatch(r"-?\d+", num_str):
-        raw_num = int(num_str)
-        raw_str = str(raw_num)
-        abs_str = str(abs(raw_num))
-        clean_id = re.sub(r"^-?100", "", abs_str)
-        variants.update({
-            raw_str,
-            abs_str,
-            clean_id,
-            f"-100{clean_id}",
-            f"-{clean_id}",
-            f"100{clean_id}",
-        })
+        raw_int = int(num_str)
+        abs_int = abs(raw_int)
+        abs_str = str(abs_int)
+        clean_str = re.sub(r"^-?100", "", abs_str)
+        if clean_str:
+            clean_int = int(clean_str)
+            full_dash_100_str = f"-100{clean_str}"
+            full_dash_100_int = int(full_dash_100_str)
+            full_100_str = f"100{clean_str}"
+            full_100_int = int(full_100_str)
 
-    return variants
+            ids.update({
+                clean_int,              # 1234567890 (int)
+                clean_str,              # "1234567890" (str)
+                full_dash_100_int,      # -1001234567890 (int)
+                full_dash_100_str,      # "-1001234567890" (str)
+                full_100_int,           # 1001234567890 (int)
+                full_100_str,           # "1001234567890" (str)
+                raw_int,                # original integer
+                str(raw_int),           # original integer as str
+                -clean_int,             # -1234567890 (int)
+                f"-{clean_str}",        # "-1234567890" (str)
+            })
+
+    return ids
 
 
-def user_subscribes_to_channel(user: UserConfig, incoming_keys: set[str]) -> bool:
-    """Check whether a user configuration has subscribed to this incoming channel."""
+def normalize_channel_variants(val: Any) -> set[str]:
+    """Return all normalized representation variants as strings."""
+    return {str(x) for x in canonical_channel_ids(val)}
+
+
+def user_subscribes_to_channel(user: UserConfig, incoming_keys: set[Any]) -> bool:
+    """Check whether a user configuration has subscribed to this incoming channel,
+    comparing canonical string and raw integer representations (handling -100 vs without -100).
+    """
     if not incoming_keys:
         return False
 
-    # Check parsed source_channels list
-    for sc in getattr(user, "source_channels", []) or []:
-        if normalize_channel_variants(sc) & incoming_keys:
-            return True
+    user_sources = canonical_channel_ids(getattr(user, "source_channels", []) or [])
+    user_sources.update(canonical_channel_ids(getattr(user, "source_channels_raw", []) or []))
 
-    # Check raw source_channels list (dicts, URLs, ints)
-    for sc in getattr(user, "source_channels_raw", []) or []:
-        if normalize_channel_variants(sc) & incoming_keys:
-            return True
-
-    return False
+    return bool(user_sources & incoming_keys)
 
 
 class ConfigStore:
@@ -491,6 +513,26 @@ async def api_save_session(session_string: str, telegram_user_id: int | str, tel
     }
     if user_id:
         payload["userId"] = user_id
+
+    # Also persist directly to Supabase if configured so session survives worker reboots
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and user_id:
+        try:
+            headers = {
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            }
+            patch_url = f"{SUPABASE_URL}/rest/v1/TelegramChannelConfig?userId=eq.{user_id}"
+            timeout = aiohttp.ClientTimeout(total=4.0)
+            async with s.patch(patch_url, headers=headers, json={
+                "sessionString": session_string,
+                "telegramUserId": str(telegram_user_id),
+                "telegramUsername": telegram_username or "",
+                "isActive": True,
+            }, timeout=timeout) as patch_resp:
+                log.info("Direct Supabase sessionString update for user %s: HTTP %d", user_id, patch_resp.status)
+        except Exception as sb_err:
+            log.warning("Direct Supabase sessionString patch error: %s", sb_err)
 
     try:
         async with s.post(SAVE_SESSION_URL, json=payload) as r:
@@ -669,9 +711,9 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
         ))
 
         return UserConfig(
-            user_id=str(raw["userId"]),
-            telegram_user_id=str(raw.get("telegramUserId") or ""),
-            session_string=str(raw.get("sessionString") or ""),
+            user_id=str(raw.get("userId") or raw.get("user_id") or ""),
+            telegram_user_id=str(raw.get("telegramUserId") or raw.get("telegram_user_id") or ""),
+            session_string=str(raw.get("sessionString") or raw.get("session_string") or raw.get("session") or ""),
             target_channel_id=primary_target,
             target_channel_name=primary_target_name,
             target_channels=list(target_ch_list) if isinstance(target_ch_list, list) else [],
@@ -679,7 +721,7 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             source_channels_raw=list(raw_sources) if isinstance(raw_sources, list) else ([raw_sources] if raw_sources else []),
             tracking_sub_id=parsed_sub_id,
             amazon_tag=parsed_amazon_tag,
-            is_active=bool(raw.get("isActive", True)),
+            is_active=bool(raw.get("isActive", raw.get("is_active", True))),
         )
     except Exception:
         log.exception("Bad config row skipped: %r", raw)
@@ -1782,13 +1824,43 @@ async def fetch_user_context(telegram_chat_id: int | str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 class MultiSessionManager:
     def __init__(self) -> None:
-        self.clients: dict[str, TelegramClient] = {}  # session_string -> TelegramClient
-        self.user_sessions: dict[str, str] = {}       # telegram_user_id -> session_string
+        self.clients: dict[str, TelegramClient] = {}       # session_string -> TelegramClient
+        self.user_sessions: dict[str, str] = {}            # telegram_user_id or user_id -> session_string
         self.bot_instance: Optional[Bot] = None
         self._lock = asyncio.Lock()
 
     def set_bot(self, bot: Bot) -> None:
         self.bot_instance = bot
+
+    def attach_deal_listener(self, client: TelegramClient, client_name: str = "client") -> None:
+        """Attach the events.NewMessage handler to ALL active client instances independently,
+        ensuring it is registered and listening for incoming deal messages.
+        """
+        # Ensure we don't attach duplicate deal listeners to the same client
+        try:
+            for handler, event_builder in client.list_event_handlers():
+                if getattr(handler, "_is_deal_listener", False):
+                    return
+        except Exception:
+            pass
+
+        async def _on_deal_msg(event: Any) -> None:
+            try:
+                if not getattr(event, "message", None):
+                    return
+                if not (event.is_channel or event.is_group):
+                    return
+                bot = self.bot_instance or global_bot
+                if bot:
+                    asyncio.create_task(handle_new_post(event, bot))
+                else:
+                    log.warning("Deal message received on client [%s], but bot instance is not set!", client_name)
+            except Exception as err:
+                log.error("Unhandled error in deal listener on client [%s]: %s", client_name, err, exc_info=True)
+
+        _on_deal_msg._is_deal_listener = True
+        client.add_event_handler(_on_deal_msg, events.NewMessage(incoming=True))
+        log.info("Attached events.NewMessage deal listener to Telethon client [%s]", client_name)
 
     async def get_or_create_client(self, session_str: str, name: str = "client") -> Optional[TelegramClient]:
         if not session_str:
@@ -1797,9 +1869,11 @@ class MultiSessionManager:
             if session_str in self.clients:
                 client = self.clients[session_str]
                 if client.is_connected():
+                    self.attach_deal_listener(client, name)
                     return client
                 try:
                     await client.connect()
+                    self.attach_deal_listener(client, name)
                     return client
                 except Exception:
                     pass
@@ -1820,18 +1894,7 @@ class MultiSessionManager:
                     await client.disconnect()
                     return None
 
-                @client.on(events.NewMessage(incoming=True))
-                async def _on_msg(event: Any) -> None:
-                    try:
-                        if not getattr(event, "message", None):
-                            return
-                        if not (event.is_channel or event.is_group):
-                            return
-                        if self.bot_instance:
-                            asyncio.create_task(handle_new_post(event, self.bot_instance))
-                    except Exception as err:
-                        log.error("Unhandled error in _on_msg event listener: %s", err, exc_info=True)
-
+                self.attach_deal_listener(client, name)
                 self.clients[session_str] = client
                 log.info("Telethon client [%s] connected & listening.", name)
                 return client
@@ -1854,8 +1917,11 @@ class MultiSessionManager:
                             await client.connect()
                             if await client.is_user_authorized():
                                 log.info("Telethon client auto-reconnected and authorized.")
+                                self.attach_deal_listener(client, "auto-reconnected")
                             else:
                                 log.warning("Telethon client reconnected but session unauthorized.")
+                        else:
+                            self.attach_deal_listener(client, "keepalive-verify")
                     except Exception as conn_err:
                         log.warning("Client auto-reconnect attempt failed (%s); will retry next cycle", conn_err)
             except Exception as loop_err:
@@ -1863,32 +1929,70 @@ class MultiSessionManager:
             await asyncio.sleep(15)
 
     async def sync_user_sessions(self, users: dict[str, UserConfig]) -> None:
-        # Also ensure the default worker SESSION_STRING is active if provided
+        """Ensure every active user session loaded from Supabase/API/session files
+        starts its own Telethon Client instance and attaches deal listener.
+        """
+        # 1. Ensure the default worker SESSION_STRING is active if provided
         if SESSION_STRING and SESSION_STRING not in self.clients:
             await self.get_or_create_client(SESSION_STRING, "global-default")
 
+        # 2. Every active user session from configs
         for u in users.values():
             if u.is_active and u.session_string:
-                self.user_sessions[str(u.telegram_user_id)] = u.session_string
-                await self.get_or_create_client(u.session_string, f"user-{u.telegram_user_id}")
+                s_id = str(u.telegram_user_id).strip()
+                if s_id:
+                    self.user_sessions[s_id] = u.session_string
+                if u.user_id:
+                    self.user_sessions[str(u.user_id)] = u.session_string
+                client = await self.get_or_create_client(u.session_string, f"user-{s_id or u.user_id}")
+                if client and client.is_connected():
+                    self.attach_deal_listener(client, f"user-{s_id or u.user_id}")
 
-    async def register_user_client(self, telegram_user_id: str, client: TelegramClient) -> None:
+        # 3. Check for any local session files on disk
+        try:
+            for sess_path in Path(".").glob("*.session"):
+                sess_name = sess_path.stem
+                if sess_name not in self.clients and sess_name != "global-default":
+                    try:
+                        c = TelegramClient(
+                            sess_name,
+                            API_ID,
+                            API_HASH,
+                            auto_reconnect=True,
+                            connection_retries=None,
+                            retry_delay=2,
+                            timeout=15,
+                        )
+                        await c.connect()
+                        if await c.is_user_authorized():
+                            self.attach_deal_listener(c, f"file-{sess_name}")
+                            self.clients[sess_name] = c
+                            log.info("Started Telethon client from session file [%s]", sess_name)
+                        else:
+                            await c.disconnect()
+                    except Exception as sess_err:
+                        log.debug("Session file %s load note: %s", sess_name, sess_err)
+        except Exception:
+            pass
+
+    async def register_user_client(
+        self,
+        telegram_user_id: str,
+        client: TelegramClient,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Dynamically register client and attach deal listener immediately
+        without requiring a full worker restart.
+        """
         session_str = client.session.save()
         async with self._lock:
             self.clients[session_str] = client
             self.user_sessions[str(telegram_user_id)] = session_str
+            if user_id:
+                self.user_sessions[str(user_id)] = session_str
 
-        @client.on(events.NewMessage(incoming=True))
-        async def _on_msg(event: Any) -> None:
-            try:
-                if not getattr(event, "message", None):
-                    return
-                if not (event.is_channel or event.is_group):
-                    return
-                if self.bot_instance:
-                    asyncio.create_task(handle_new_post(event, self.bot_instance))
-            except Exception as err:
-                log.error("Unhandled error in user _on_msg listener: %s", err, exc_info=True)
+        self.attach_deal_listener(client, f"user-{telegram_user_id}")
+        log.info("Dynamically registered client & attached deal listener for user %s (user_id=%s)", telegram_user_id, user_id)
 
     async def get_client_for_telegram_id(self, telegram_user_id: int | str) -> Optional[TelegramClient]:
         s_id = str(telegram_user_id).strip()
@@ -1897,6 +2001,7 @@ class MultiSessionManager:
             c = self.clients[sess]
             if not c.is_connected():
                 await c.connect()
+            self.attach_deal_listener(c, f"user-{s_id}")
             return c
 
         u = store.get_by_telegram_id(s_id)
@@ -2137,12 +2242,11 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
                     is_real_media=is_real_media,
                     reply_markup=aiogram_reply_markup,
                 )
-                if posted:
-                    log.info("Posted deal to target %s via official Bot Token with native inline buttons for user %s", target, user.user_id)
-                else:
-                    log.info("Bot Token posting to %s failed; switching to Telethon User Client mode...", target)
+                if not posted:
+                    err_msg = "Bot Token posting returned False"
             except Exception as bot_err:
-                log.info("Bot Token posting to %s threw exception (%s); switching to Telethon User Client mode...", target, bot_err)
+                err_msg = str(bot_err)
+                log.info("Bot Token posting to %s failed (%s); switching to Telethon User Client mode...", target, bot_err)
 
         # ------------------------------------------------------------------- #
         # MODE 2: Telethon User Client Delivery (Fallback)
@@ -2158,15 +2262,17 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
                     is_real_media=is_real_media,
                     buttons=telethon_buttons if telethon_buttons else None,
                 )
-                if posted:
-                    log.info("Posted deal to target %s via Telethon client for user %s", target, user.user_id)
-                else:
-                    log.error("Telethon posting failed to %s for user %s", target, user.user_id)
+                if not posted:
+                    err_msg = "Telethon User Client posting returned False"
             except Exception as client_err:
+                err_msg = str(client_err)
                 log.error("Telethon User Client posting exception for %s: %s", target, client_err)
 
         if posted:
             any_posted = True
+            log.info(f"[DISPATCH SUCCESS] Sent deal to user {user.user_id} target channel {target}")
+        else:
+            log.error(f"[DISPATCH ERROR] Failed for user {user.user_id}: {err_msg or 'Could not send via Bot Token or Telethon'}")
 
     return any_posted
 
@@ -2175,7 +2281,7 @@ async def safe_post(bot: Bot, user: UserConfig, text: str, msg: Any, media_path:
     try:
         return await post_to_user(bot, user, text, msg, media_path)
     except Exception as e:
-        log.error("safe_post failed for user %s: %s", getattr(user, "user_id", "unknown"), e)
+        log.error(f"[DISPATCH ERROR] Failed for user {getattr(user, 'user_id', 'unknown')}: {e}")
         return False
 
 
@@ -2195,18 +2301,19 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
             except Exception as e:
                 log.debug("event.get_chat timed out/failed: %s", e)
 
-        # 1. Comprehensive incoming channel keys extraction
-        incoming_keys = set()
+        # 1. Source Channel ID Normalization: convert both incoming ID and stored source_channel_ids
+        # to canonical string and raw integer (handle -100... vs without -100)
+        incoming_keys: set[Any] = set()
+        if chat_id is not None:
+            incoming_keys.update(canonical_channel_ids(chat_id))
         if chat:
-            incoming_keys.update(chat_keys(chat))
+            incoming_keys.update(canonical_channel_ids(chat))
             uname = getattr(chat, "username", None)
             if uname:
-                incoming_keys.update(normalize_channel_variants(uname))
+                incoming_keys.update(canonical_channel_ids(uname))
             cid = getattr(chat, "id", None)
             if cid is not None:
-                incoming_keys.update(normalize_channel_variants(cid))
-        if chat_id is not None:
-            incoming_keys.update(normalize_channel_variants(chat_id))
+                incoming_keys.update(canonical_channel_ids(cid))
 
         # 2. Query all active configurations/sessions from database/cache
         all_active_configs = await get_all_active_configs_from_db_and_cache()
@@ -2315,17 +2422,18 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
         delivered_count = 0
         try:
             for u in subscribed_users:
+                user_target = u.target_channel_id or (u.target_channels[0] if u.target_channels else "unknown")
                 try:
-                    log.info("Dispatching deal to user %s (target: %s)...", u.user_id, u.target_channel_id)
+                    log.info("Dispatching deal to user %s (target: %s)...", u.user_id, user_target)
                     success = await post_to_user(bot, u, display_text, msg, media_path)
                     if success:
                         delivered_count += 1
+                        log.info(f"[DISPATCH SUCCESS] Sent deal to user {u.user_id} target channel {user_target}")
+                    else:
+                        log.error(f"[DISPATCH ERROR] Failed for user {u.user_id}: Delivery returned False for target channel {user_target}")
                 except Exception as user_err:
                     log.error(
-                        "Independent delivery failed for user %s (%s): %s",
-                        getattr(u, "user_id", "unknown"),
-                        getattr(u, "target_channel_id", "unknown"),
-                        user_err,
+                        f"[DISPATCH ERROR] Failed for user {getattr(u, 'user_id', 'unknown')}: {user_err}",
                         exc_info=True,
                     )
                     continue
@@ -3238,8 +3346,42 @@ async def finish_login(
 
     pop_login_session(tg_user_id)
 
-    # Register live client
-    await session_mgr.register_user_client(str(tg_user_id), client)
+    # 1. Dynamically register client and attach deal listener immediately without requiring a full worker restart
+    await session_mgr.register_user_client(str(tg_user_id), client, user_id=user_id)
+
+    # 2. Update in-memory user configs immediately
+    if user_id:
+        _telegram_to_user_id[str(tg_user_id)] = user_id
+        if user_id in store.users:
+            store.users[user_id].session_string = session_str
+            store.users[user_id].telegram_user_id = str(tg_user_id)
+            store.users[user_id].is_active = True
+    u_cfg = store.get_by_telegram_id(tg_user_id)
+    if u_cfg:
+        u_cfg.session_string = session_str
+        u_cfg.is_active = True
+
+    # 3. Directly save to Supabase so it's persisted immediately across worker restarts
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and user_id:
+        try:
+            s_http = await http()
+            headers = {
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            }
+            patch_url = f"{SUPABASE_URL}/rest/v1/TelegramChannelConfig?userId=eq.{user_id}"
+            timeout = aiohttp.ClientTimeout(total=4.0)
+            async with s_http.patch(patch_url, headers=headers, json={
+                "sessionString": session_str,
+                "telegramUserId": str(tg_user_id),
+                "telegramUsername": tg_user.username or "",
+                "isActive": True,
+            }, timeout=timeout) as p_resp:
+                log.info("Directly patched sessionString into Supabase for user %s: HTTP %d", user_id, p_resp.status)
+        except Exception as sb_patch_err:
+            log.warning("Supabase direct sessionString patch error: %s", sb_patch_err)
+
     asyncio.create_task(refresh_configs())
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -4014,6 +4156,8 @@ async def main() -> None:
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
     log.info("Bot online as @%s (id=%d)", me.username, me.id)
+    global global_bot
+    global_bot = bot
     session_mgr.set_bot(bot)
 
     # Initial load of configs & clients
