@@ -2204,6 +2204,86 @@ def get_main_menu_keyboard(is_logged_in: bool = False, is_linked: bool = False) 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+async def link_telegram_in_supabase(
+    user_id: str,
+    telegram_user_id: int | str,
+    telegram_username: Optional[str] = None,
+) -> bool:
+    """Link user's telegram_chat_id with their account/session in Supabase."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and user_id):
+        return False
+    try:
+        s = await http()
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        timeout = aiohttp.ClientTimeout(total=4.0)
+
+        # 1. Attempt PATCH to existing TelegramChannelConfig record for this user
+        patch_url = f"{SUPABASE_URL}/rest/v1/TelegramChannelConfig?userId=eq.{user_id}"
+        payload = {
+            "telegramUserId": str(telegram_user_id),
+            "telegramUsername": telegram_username or "",
+            "isActive": True,
+        }
+        async with s.patch(patch_url, headers=headers, json=payload, timeout=timeout) as patch_resp:
+            if patch_resp.status in (200, 204):
+                log.info("Linked telegram_chat_id %s to userId %s in Supabase via PATCH", telegram_user_id, user_id)
+                return True
+
+        # 2. Attempt insert/upsert if not yet existing
+        post_url = f"{SUPABASE_URL}/rest/v1/TelegramChannelConfig"
+        post_headers = {**headers, "Prefer": "resolution=merge-duplicates"}
+        post_payload = {
+            "userId": user_id,
+            "telegramUserId": str(telegram_user_id),
+            "telegramUsername": telegram_username or "",
+            "isActive": True,
+        }
+        async with s.post(post_url, headers=post_headers, json=post_payload, timeout=timeout) as post_resp:
+            if post_resp.status in (200, 201, 204):
+                log.info("Linked telegram_chat_id %s to userId %s in Supabase via POST", telegram_user_id, user_id)
+                return True
+    except Exception as e:
+        log.warning("link_telegram_in_supabase error: %s", e)
+    return False
+
+
+async def resolve_payload_user_id(payload: str) -> str:
+    """Resolve token/payload to a valid userId."""
+    clean_p = (payload or "").strip()
+    if not clean_p:
+        return ""
+    # Direct UUID check
+    if len(clean_p) == 36 and clean_p.count("-") == 4:
+        return clean_p
+
+    # Supabase User lookup by id, referralCode, or subIdPrefix
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        try:
+            s = await http()
+            headers = {
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            }
+            url = f"{SUPABASE_URL}/rest/v1/User?or=(id.eq.{clean_p},referralCode.eq.{clean_p},subIdPrefix.eq.{clean_p})&select=id"
+            timeout = aiohttp.ClientTimeout(total=4.0)
+            async with s.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status == 200:
+                    rows = await resp.json()
+                    if rows and isinstance(rows, list) and len(rows) > 0 and rows[0].get("id"):
+                        return str(rows[0]["id"])
+        except Exception as e:
+            log.debug("resolve_payload_user_id lookup error: %s", e)
+
+    return clean_p
+
+
+@router.message(F.text.regexp(r"^/start(?:\s+(.+))?"))
 @router.message(CommandStart())
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject = None, state: FSMContext = None) -> None:
@@ -2212,130 +2292,100 @@ async def cmd_start(message: Message, command: CommandObject = None, state: FSMC
         await message.answer("❌ Couldn't identify your Telegram account.")
         return
 
-    # 1. Extract start payload (support command.args or message.text)
-    arg = ""
-    if command and command.args:
-        arg = command.args.strip()
+    telegram_chat_id = message.chat.id
+    telegram_user_id = tg_user.id
+    telegram_username = tg_user.username or ""
+
+    # 1. Extract start payload (support regex pattern, command.args, or message.text)
+    match = re.search(r"^/start(?:\s+(.+))?", (message.text or "").strip(), re.IGNORECASE)
+    raw_payload = ""
+    if match and match.group(1):
+        raw_payload = match.group(1).strip()
+    elif command and command.args:
+        raw_payload = command.args.strip()
     elif message.text and len(message.text.split(maxsplit=1)) > 1:
-        arg = message.text.split(maxsplit=1)[1].strip()
+        raw_payload = message.text.split(maxsplit=1)[1].strip()
 
-    user_id = ""
-    if arg:
-        clean_arg = re.sub(r"^[?&]start=", "", arg).strip()
+    token_payload = ""
+    if raw_payload:
+        clean_arg = re.sub(r"^[?&]start=", "", raw_payload).strip()
         if clean_arg.startswith("AUTH_"):
-            user_id = clean_arg[len("AUTH_"):].strip()
+            token_payload = clean_arg[len("AUTH_"):].strip()
         else:
-            user_id = clean_arg.strip()
-        user_id = user_id.split("?")[0].split("&")[0].strip()
+            token_payload = clean_arg.strip()
+        token_payload = token_payload.split("?")[0].split("&")[0].strip()
 
-    if user_id:
-        # Save verified userId directly in memory and FSM state
-        _telegram_to_user_id[str(tg_user.id)] = user_id
+    # 2. Payload Handling: if a payload parameter exists in /start
+    if token_payload:
+        user_id = await resolve_payload_user_id(token_payload)
+
+        # Link the user's telegram_chat_id with that account/session in Supabase
+        await link_telegram_in_supabase(user_id=user_id, telegram_user_id=telegram_chat_id, telegram_username=telegram_username)
+
+        # Sync with backend API
+        await api_verify_sync(user_id, telegram_chat_id, telegram_username)
+        await api_save_user_config({
+            "userId": user_id,
+            "telegramUserId": str(telegram_chat_id),
+            "telegramUsername": telegram_username,
+            "isActive": True,
+        })
+        asyncio.create_task(refresh_configs())
+
+        # Update in-memory mapping and FSM state
+        _telegram_to_user_id[str(telegram_user_id)] = user_id
+        if str(telegram_chat_id) != str(telegram_user_id):
+            _telegram_to_user_id[str(telegram_chat_id)] = user_id
         if state:
             await state.update_data(user_id=user_id)
 
-        res = await api_verify_sync(user_id, tg_user.id, tg_user.username)
-        sub_id = (
-            res.get("trackingSubId")
-            or res.get("subId")
-            or (res.get("user") or {}).get("trackingSubId")
-            or (res.get("user") or {}).get("subId")
-            or (res.get("data") or {}).get("trackingSubId")
-            or (res.get("data") or {}).get("subId")
-            or ""
-        )
-        if not sub_id:
-            cfg_rows = await api_fetch_configs(user_id=user_id)
-            if cfg_rows:
-                sub_id = (
-                    cfg_rows[0].get("trackingSubId")
-                    or cfg_rows[0].get("subId")
-                    or (cfg_rows[0].get("user") or {}).get("trackingSubId")
-                    or (cfg_rows[0].get("user") or {}).get("subId")
-                    or ""
-                )
+        # Fetch configurations to resolve SubID and Amazon Tag
+        cfg_rows = await api_fetch_configs(user_id=user_id)
+        if not cfg_rows:
+            cfg_rows = await api_fetch_configs(telegram_id=telegram_chat_id)
 
-        if sub_id:
-            _telegram_to_sub_id[str(tg_user.id)] = sub_id
-            if state:
-                await state.update_data(tracking_sub_id=sub_id, sub_id=sub_id)
-
-        status_code = res.get("_status")
-        is_success = (status_code == 200 or res.get("success") is True or "successfully" in str(res.get("message") or "").lower())
-
-        if is_success:
-            asyncio.create_task(refresh_configs())
-            sub_id_display = sub_id if sub_id else "Configured in Dashboard"
-            custom_tag = clean_amazon_associate_tag(
-                res.get("customAmazonTag")
-                or res.get("amazonTag")
-                or (res.get("user") or {}).get("customAmazonTag")
-                or (res.get("user") or {}).get("amazonTag")
-                or (cfg_rows[0].get("customAmazonTag") if cfg_rows else None)
-                or (cfg_rows[0].get("amazonTag") if cfg_rows else None)
-                or _telegram_to_amazon_tag.get(str(tg_user.id))
+        sub_id = ""
+        custom_tag = ""
+        u_cfg = None
+        if cfg_rows:
+            first_cfg = cfg_rows[0]
+            u_cfg = parse_config(first_cfg)
+            sub_id = (
+                first_cfg.get("subId")
+                or first_cfg.get("trackingSubId")
+                or (first_cfg.get("user") or {}).get("trackingSubId")
+                or (first_cfg.get("user") or {}).get("subId")
+                or (f"{(first_cfg.get('user') or {}).get('subIdPrefix')}_tg" if (first_cfg.get("user") or {}).get("subIdPrefix") else "")
                 or ""
             )
-            if custom_tag:
-                _telegram_to_amazon_tag[str(tg_user.id)] = custom_tag
-                amazon_tag_display = custom_tag
-            else:
-                effective_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
-                amazon_tag_display = f"kamaikaro02-21 (SubTag: {effective_sub})"
-
-            await message.answer(
-                f"✅ <b>Account Connected Successfully!</b>\n\n"
-                f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
-                f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id_display}</code>\n"
-                f"🏷️ <b>Amazon Tag:</b> <code>{amazon_tag_display}</code>\n\n"
-                "👉 Tap <b>[📱 Login Telegram Account]</b> below to link your Telegram session so KamaiKaro can access your channels:",
-                reply_markup=get_main_menu_keyboard(is_logged_in=False, is_linked=True),
-                parse_mode="HTML",
+            custom_tag = clean_amazon_associate_tag(
+                first_cfg.get("customAmazonTag")
+                or first_cfg.get("amazonTag")
+                or (first_cfg.get("user") or {}).get("customAmazonTag")
+                or (first_cfg.get("user") or {}).get("amazonTag")
+                or ""
             )
-            return
-        else:
-            err = res.get("error") or res.get("message") or f"HTTP {status_code}"
-            await message.answer(
-                f"❌ <b>Account Linking Failed:</b> {err}\n\n"
-                f"Please open your dashboard at <a href=\"{BASE_WEB_URL}/telegram-bot\">{BASE_WEB_URL}/telegram-bot</a> and click <b>Open in Telegram</b> to generate a valid connection link.",
-                parse_mode="HTML",
-            )
-            return
 
-    # 2. No start payload: check if user is already linked in memory, state, or database
-    stored_user_id = _telegram_to_user_id.get(str(tg_user.id))
-    if not stored_user_id and state:
-        stored_user_id = (await state.get_data()).get("user_id")
-
-    u_cfg = store.get_by_telegram_id(tg_user.id)
-    if not stored_user_id and u_cfg and u_cfg.user_id:
-        stored_user_id = u_cfg.user_id
-        _telegram_to_user_id[str(tg_user.id)] = stored_user_id
-
-    if not stored_user_id:
-        db_rows = await api_fetch_configs(telegram_id=tg_user.id)
-        if db_rows and db_rows[0].get("userId"):
-            stored_user_id = db_rows[0]["userId"]
-            _telegram_to_user_id[str(tg_user.id)] = stored_user_id
-            if db_rows[0].get("trackingSubId") and not u_cfg:
-                u_cfg = parse_config(db_rows[0])
-
-    if stored_user_id:
+        compact_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
+        _telegram_to_sub_id[str(telegram_user_id)] = compact_sub
+        if str(telegram_chat_id) != str(telegram_user_id):
+            _telegram_to_sub_id[str(telegram_chat_id)] = compact_sub
         if state:
-            await state.update_data(user_id=stored_user_id)
-        is_logged_in = bool(u_cfg and u_cfg.session_string)
-        sub_id = u_cfg.tracking_sub_id if u_cfg and u_cfg.tracking_sub_id else (_telegram_to_sub_id.get(str(tg_user.id)) or "Configured in Dashboard")
-        custom_tag = clean_amazon_associate_tag((u_cfg.amazon_tag if u_cfg and u_cfg.amazon_tag else None) or _telegram_to_amazon_tag.get(str(tg_user.id)) or "")
-        effective_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=stored_user_id)
+            await state.update_data(tracking_sub_id=compact_sub, sub_id=compact_sub)
+
         if custom_tag:
+            _telegram_to_amazon_tag[str(telegram_user_id)] = custom_tag
             amazon_tag_display = custom_tag
         else:
-            amazon_tag_display = f"kamaikaro02-21 (SubTag: {effective_sub})"
+            amazon_tag_display = f"kamaikaro02-21 (SubTag: {compact_sub})"
 
+        is_logged_in = bool(u_cfg and u_cfg.session_string)
+
+        # Deliver the standard Welcome Menu message immediately (with Linked User ID, Tracking SubID, and Amazon Tag)
         await message.answer(
             f"👋 <b>Welcome back to KamaiKaro Deal Automation Bot!</b>\n\n"
-            f"👤 <b>Linked User ID:</b> <code>{stored_user_id}</code>\n"
-            f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id}</code>\n"
+            f"👤 <b>Linked User ID:</b> <code>{user_id}</code>\n"
+            f"🔗 <b>Your Tracking SubID:</b> <code>{compact_sub}</code>\n"
             f"🏷️ <b>Amazon Tag:</b> <code>{amazon_tag_display}</code>\n\n"
             "Select an option below to manage your automation:",
             reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in, is_linked=True),
@@ -2343,7 +2393,52 @@ async def cmd_start(message: Message, command: CommandObject = None, state: FSMC
         )
         return
 
-    # 3. No user ID found: prompt user to click "Open in Telegram" from web dashboard (NO dummy fallbacks)
+    # 3. No start payload: check if user is already linked in memory, state, or database
+    stored_user_id = _telegram_to_user_id.get(str(telegram_user_id)) or _telegram_to_user_id.get(str(telegram_chat_id))
+    if not stored_user_id and state:
+        stored_user_id = (await state.get_data()).get("user_id")
+
+    u_cfg = store.get_by_telegram_id(telegram_user_id) or store.get_by_telegram_id(telegram_chat_id)
+    if not stored_user_id and u_cfg and u_cfg.user_id:
+        stored_user_id = u_cfg.user_id
+        _telegram_to_user_id[str(telegram_user_id)] = stored_user_id
+
+    if not stored_user_id:
+        db_rows = await api_fetch_configs(telegram_id=telegram_user_id)
+        if not db_rows and telegram_chat_id != telegram_user_id:
+            db_rows = await api_fetch_configs(telegram_id=telegram_chat_id)
+        if db_rows and db_rows[0].get("userId"):
+            stored_user_id = db_rows[0]["userId"]
+            _telegram_to_user_id[str(telegram_user_id)] = stored_user_id
+            if db_rows[0].get("trackingSubId") and not u_cfg:
+                u_cfg = parse_config(db_rows[0])
+
+    if stored_user_id:
+        if state:
+            await state.update_data(user_id=stored_user_id)
+        is_logged_in = bool(u_cfg and u_cfg.session_string)
+        raw_sub = u_cfg.tracking_sub_id if u_cfg and u_cfg.tracking_sub_id else (_telegram_to_sub_id.get(str(telegram_user_id)) or "")
+        compact_sub = resolve_compact_sub_id(sub_id=raw_sub, user_id=stored_user_id)
+        _telegram_to_sub_id[str(telegram_user_id)] = compact_sub
+
+        custom_tag = clean_amazon_associate_tag((u_cfg.amazon_tag if u_cfg and u_cfg.amazon_tag else None) or _telegram_to_amazon_tag.get(str(telegram_user_id)) or "")
+        if custom_tag:
+            amazon_tag_display = custom_tag
+        else:
+            amazon_tag_display = f"kamaikaro02-21 (SubTag: {compact_sub})"
+
+        await message.answer(
+            f"👋 <b>Welcome back to KamaiKaro Deal Automation Bot!</b>\n\n"
+            f"👤 <b>Linked User ID:</b> <code>{stored_user_id}</code>\n"
+            f"🔗 <b>Your Tracking SubID:</b> <code>{compact_sub}</code>\n"
+            f"🏷️ <b>Amazon Tag:</b> <code>{amazon_tag_display}</code>\n\n"
+            "Select an option below to manage your automation:",
+            reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in, is_linked=True),
+            parse_mode="HTML",
+        )
+        return
+
+    # 4. No user ID found: prompt user to click "Open in Telegram" from web dashboard (NO dummy fallbacks)
     dashboard_url = f"{BASE_WEB_URL}/telegram-bot"
     unlinked_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Open Web Dashboard", url=dashboard_url)],
