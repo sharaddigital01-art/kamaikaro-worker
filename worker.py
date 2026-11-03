@@ -272,6 +272,72 @@ class UserConfig:
     is_active: bool = True
 
 
+def normalize_channel_variants(val: Any) -> set[str]:
+    """Return all normalized representation variants for a channel ID, username, or URL.
+    Handles int, str, dict (with id/username/title), and URL formats.
+    """
+    variants: set[str] = set()
+    if val is None:
+        return variants
+
+    if isinstance(val, dict):
+        for k in ("id", "channelId", "channel_id", "chat_id", "username", "value"):
+            v = val.get(k)
+            if v is not None:
+                variants.update(normalize_channel_variants(v))
+        return variants
+
+    s = str(val).strip()
+    if not s:
+        return variants
+
+    # Strip URL formatting (https://t.me/...)
+    clean_s = re.sub(r"^https?://(?:www\.)?t\.me/", "", s, flags=re.I)
+    clean_s = clean_s.split("/")[0].split("?")[0].strip()
+
+    # Lowercase username variants
+    uname = clean_s.lstrip("@").strip().lower()
+    if uname:
+        variants.add(uname)
+        variants.add(f"@{uname}")
+
+    # Numeric ID variants (Telegram channel IDs often start with -100 or - or raw digits)
+    num_str = clean_s.lstrip("@")
+    if re.fullmatch(r"-?\d+", num_str):
+        raw_num = int(num_str)
+        raw_str = str(raw_num)
+        abs_str = str(abs(raw_num))
+        clean_id = re.sub(r"^-?100", "", abs_str)
+        variants.update({
+            raw_str,
+            abs_str,
+            clean_id,
+            f"-100{clean_id}",
+            f"-{clean_id}",
+            f"100{clean_id}",
+        })
+
+    return variants
+
+
+def user_subscribes_to_channel(user: UserConfig, incoming_keys: set[str]) -> bool:
+    """Check whether a user configuration has subscribed to this incoming channel."""
+    if not incoming_keys:
+        return False
+
+    # Check parsed source_channels list
+    for sc in getattr(user, "source_channels", []) or []:
+        if normalize_channel_variants(sc) & incoming_keys:
+            return True
+
+    # Check raw source_channels list (dicts, URLs, ints)
+    for sc in getattr(user, "source_channels_raw", []) or []:
+        if normalize_channel_variants(sc) & incoming_keys:
+            return True
+
+    return False
+
+
 class ConfigStore:
     def __init__(self) -> None:
         self.users: dict[str, UserConfig] = {}
@@ -286,16 +352,7 @@ class ConfigStore:
         for u in self.users.values():
             if not (u.is_active and (u.target_channel_id or u.target_channels)):
                 continue
-            user_sources = set()
-            for c in u.source_channels:
-                norm = norm_channel(c)
-                if norm:
-                    user_sources.add(norm)
-                    if re.fullmatch(r"-?\d+", norm):
-                        raw_id = norm.lstrip("-")
-                        clean_id = re.sub(r"^100", "", raw_id)
-                        user_sources.update({norm, raw_id, clean_id, f"-100{clean_id}"})
-            if user_sources & source_keys:
+            if user_subscribes_to_channel(u, source_keys):
                 out.append(u)
         return out
 
@@ -321,14 +378,8 @@ class ConfigStore:
         s: set[str] = set()
         for u in self.users.values():
             if u.is_active:
-                for c in u.source_channels:
-                    norm = norm_channel(c)
-                    if norm:
-                        s.add(norm)
-                        if re.fullmatch(r"-?\d+", norm):
-                            raw_id = norm.lstrip("-")
-                            clean_id = re.sub(r"^100", "", raw_id)
-                            s.update({norm, raw_id, clean_id, f"-100{clean_id}"})
+                for c in (u.source_channels or []) + (u.source_channels_raw or []):
+                    s.update(normalize_channel_variants(c))
         s.discard("")
         return s
 
@@ -541,29 +592,56 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
     try:
         raw_sources = raw.get("sourceChannels") or []
         if isinstance(raw_sources, str):
-            raw_sources = [x for x in re.split(r"[,\s]+", raw_sources) if x]
+            raw_sources = raw_sources.strip()
+            if raw_sources.startswith("[") or raw_sources.startswith("{"):
+                try:
+                    raw_sources = json.loads(raw_sources)
+                except Exception:
+                    raw_sources = [x for x in re.split(r"[,\s]+", raw_sources) if x]
+            else:
+                raw_sources = [x for x in re.split(r"[,\s]+", raw_sources) if x]
 
         source_names: list[str] = []
-        for x in raw_sources:
-            if isinstance(x, dict):
-                uname = x.get("username")
-                cid = x.get("id")
-                if uname:
-                    source_names.append(str(uname))
-                if cid:
-                    source_names.append(str(cid))
-            elif x:
-                source_names.append(str(x))
+        if isinstance(raw_sources, list):
+            for x in raw_sources:
+                if isinstance(x, dict):
+                    uname = x.get("username")
+                    cid = x.get("id") or x.get("channelId") or x.get("channel_id") or x.get("chat_id")
+                    if uname:
+                        source_names.append(str(uname))
+                    if cid is not None:
+                        source_names.append(str(cid))
+                elif x:
+                    source_names.append(str(x))
+        elif isinstance(raw_sources, dict):
+            uname = raw_sources.get("username")
+            cid = raw_sources.get("id") or raw_sources.get("channelId") or raw_sources.get("channel_id") or raw_sources.get("chat_id")
+            if uname:
+                source_names.append(str(uname))
+            if cid is not None:
+                source_names.append(str(cid))
+        elif raw_sources:
+            source_names.append(str(raw_sources))
 
         target_ch_list = raw.get("targetChannels") or []
+        if isinstance(target_ch_list, str):
+            target_ch_list = target_ch_list.strip()
+            if target_ch_list.startswith("[") or target_ch_list.startswith("{"):
+                try:
+                    target_ch_list = json.loads(target_ch_list)
+                except Exception:
+                    target_ch_list = [x for x in re.split(r"[,\s]+", target_ch_list) if x]
+            else:
+                target_ch_list = [x for x in re.split(r"[,\s]+", target_ch_list) if x]
+
         primary_target = parse_target(raw.get("targetChannelId"))
         primary_target_name = str(raw.get("targetChannelName") or "")
 
         if not primary_target and target_ch_list and isinstance(target_ch_list, list):
             first = target_ch_list[0]
             if isinstance(first, dict):
-                primary_target = parse_target(first.get("id"))
-                primary_target_name = first.get("title") or ""
+                primary_target = parse_target(first.get("id") or first.get("channelId") or first.get("channel_id"))
+                primary_target_name = first.get("title") or first.get("name") or ""
             else:
                 primary_target = parse_target(first)
 
@@ -598,7 +676,7 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             target_channel_name=primary_target_name,
             target_channels=list(target_ch_list) if isinstance(target_ch_list, list) else [],
             source_channels=source_names,
-            source_channels_raw=list(raw_sources) if isinstance(raw_sources, list) else [],
+            source_channels_raw=list(raw_sources) if isinstance(raw_sources, list) else ([raw_sources] if raw_sources else []),
             tracking_sub_id=parsed_sub_id,
             amazon_tag=parsed_amazon_tag,
             is_active=bool(raw.get("isActive", True)),
@@ -606,6 +684,76 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
     except Exception:
         log.exception("Bad config row skipped: %r", raw)
         return None
+
+
+_last_configs_fetch_time: float = 0.0
+_cached_active_configs: list[UserConfig] = []
+
+
+async def get_all_active_configs_from_db_and_cache(force_refresh: bool = False) -> list[UserConfig]:
+    """Query all active configurations/sessions from database (Supabase),
+    backend API, and in-memory cache, merging them so no subscribed user is missed.
+    Uses 15-second TTL cache for high performance during fast deal streams.
+    """
+    global _last_configs_fetch_time, _cached_active_configs
+    now = time.time()
+    if not force_refresh and _cached_active_configs and (now - _last_configs_fetch_time < 15.0):
+        return _cached_active_configs
+
+    configs_by_user_id: dict[str, UserConfig] = {}
+
+    # 1. Start with in-memory cached configs
+    for uid, u in store.users.items():
+        if u and u.is_active:
+            configs_by_user_id[str(uid)] = u
+
+    # 2. Query direct Supabase REST if configured
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        try:
+            s = await http()
+            headers = {
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            }
+            url = f"{SUPABASE_URL}/rest/v1/TelegramChannelConfig?isActive=eq.true"
+            timeout = aiohttp.ClientTimeout(total=3.0)
+            async with s.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status == 200:
+                    rows = await resp.json()
+                    if isinstance(rows, list):
+                        for r in rows:
+                            cfg = parse_config(r)
+                            if cfg and cfg.is_active:
+                                configs_by_user_id[str(cfg.user_id)] = cfg
+                                if cfg.telegram_user_id:
+                                    _telegram_to_user_id[str(cfg.telegram_user_id)] = cfg.user_id
+                                    if cfg.tracking_sub_id:
+                                        _telegram_to_sub_id[str(cfg.telegram_user_id)] = cfg.tracking_sub_id
+                                    if cfg.amazon_tag:
+                                        _telegram_to_amazon_tag[str(cfg.telegram_user_id)] = cfg.amazon_tag
+        except Exception as sb_err:
+            log.debug("Direct Supabase query for active configs note: %s", sb_err)
+
+    # 3. Fallback to backend API if still empty
+    if not configs_by_user_id:
+        try:
+            api_rows = await api_fetch_configs()
+            if api_rows and isinstance(api_rows, list):
+                for r in api_rows:
+                    cfg = parse_config(r)
+                    if cfg and cfg.is_active:
+                        configs_by_user_id[str(cfg.user_id)] = cfg
+        except Exception as api_err:
+            log.debug("Backend API query for active configs note: %s", api_err)
+
+    if configs_by_user_id:
+        store.users.update(configs_by_user_id)
+        _cached_active_configs = list(configs_by_user_id.values())
+        _last_configs_fetch_time = now
+        return _cached_active_configs
+
+    return list(store.users.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -1917,7 +2065,7 @@ async def telethon_send_with_retry(
     return False
 
 
-async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> None:
+async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> bool:
     # 1. Strictly resolve active user's SubID and Amazon Associate Tag from memory/state or database
     sub_id = await resolve_user_sub_id(user)
     amazon_tag = await resolve_user_amazon_tag(user)
@@ -1959,7 +2107,7 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
 
     if not targets:
         log.warning("User %s has no target channels configured; skipping delivery", user.user_id)
-        return
+        return False
 
     is_real_media = bool(
         getattr(msg, "photo", None)
@@ -1971,6 +2119,7 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
     u_client = await session_mgr.get_client_for_telegram_id(user.telegram_user_id)
 
     # 6. Post to each target channel using Dual-Mode Delivery with Retry Logic
+    any_posted = False
     for target in targets:
         posted = False
 
@@ -2016,13 +2165,17 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
             except Exception as client_err:
                 log.error("Telethon User Client posting exception for %s: %s", target, client_err)
 
+        if posted:
+            any_posted = True
+
+    return any_posted
+
 
 async def safe_post(bot: Bot, user: UserConfig, text: str, msg: Any, media_path: Optional[str]) -> bool:
     try:
-        await post_to_user(bot, user, text, msg, media_path)
-        return True
+        return await post_to_user(bot, user, text, msg, media_path)
     except Exception as e:
-        log.error("safe_post failed for user %s: %s", user.user_id, e)
+        log.error("safe_post failed for user %s: %s", getattr(user, "user_id", "unknown"), e)
         return False
 
 
@@ -2032,19 +2185,8 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
         if not msg:
             return
 
-        # ------------------------------------------------------------------- #
-        # Strict Duplicate Prevention (Deduplication) - 2 Hours TTL
-        # 1. Source Message Level Deduplication
-        # ------------------------------------------------------------------- #
         chat_id = getattr(event, "chat_id", None)
         msg_id = getattr(msg, "id", None)
-        msg_fp = None
-        if chat_id is not None and msg_id is not None:
-            msg_fp = get_deal_fingerprint(f"msg:{chat_id}:{msg_id}")
-            if msg_fp in recent_deal_cache:
-                log.info("Duplicate post detected via source message ID %s:%s; skipping", chat_id, msg_id)
-                return
-            recent_deal_cache.add(msg_fp)
 
         chat = getattr(event, "chat", None)
         if chat is None:
@@ -2053,24 +2195,45 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
             except Exception as e:
                 log.debug("event.get_chat timed out/failed: %s", e)
 
-        c_keys = set()
+        # 1. Comprehensive incoming channel keys extraction
+        incoming_keys = set()
         if chat:
-            c_keys.update(chat_keys(chat))
+            incoming_keys.update(chat_keys(chat))
+            uname = getattr(chat, "username", None)
+            if uname:
+                incoming_keys.update(normalize_channel_variants(uname))
+            cid = getattr(chat, "id", None)
+            if cid is not None:
+                incoming_keys.update(normalize_channel_variants(cid))
         if chat_id is not None:
-            raw_id = str(chat_id)
-            abs_id = str(abs(chat_id))
-            clean_id = re.sub(r"^-?100", "", abs_id)
-            c_keys.update({raw_id, abs_id, clean_id, f"-100{clean_id}", f"-{clean_id}"})
+            incoming_keys.update(normalize_channel_variants(chat_id))
 
-        active_sources = store.all_sources()
+        # 2. Query all active configurations/sessions from database/cache
+        all_active_configs = await get_all_active_configs_from_db_and_cache()
+        subscribed_users: list[UserConfig] = []
+        for u in all_active_configs:
+            if not u.is_active:
+                continue
+            if not (u.target_channel_id or u.target_channels):
+                continue
+            if user_subscribes_to_channel(u, incoming_keys):
+                subscribed_users.append(u)
 
-        # If active source channels are monitored, only proceed if chat matches
-        if active_sources and not (c_keys & active_sources):
+        if not subscribed_users:
+            log.debug("No active subscribers found for incoming channel keys: %s", list(incoming_keys)[:5])
             return
 
-        users = store.active_for_source(c_keys)
-        if not users:
-            return
+        # ------------------------------------------------------------------- #
+        # Strict Duplicate Prevention (Deduplication) - 2 Hours TTL
+        # 1. Source Message Level Deduplication
+        # ------------------------------------------------------------------- #
+        msg_fp = None
+        if chat_id is not None and msg_id is not None:
+            msg_fp = get_deal_fingerprint(f"msg:{chat_id}:{msg_id}")
+            if msg_fp in recent_deal_cache:
+                log.info("Duplicate post detected via source message ID %s:%s; skipping broadcast", chat_id, msg_id)
+                return
+            recent_deal_cache.add(msg_fp)
 
         raw_text = msg.message or ""
         display_text = fix_split_urls(raw_text)
@@ -2140,14 +2303,34 @@ async def handle_new_post(event: Any, bot: Bot) -> None:
             except Exception as media_err:
                 log.warning("Media download failed (%s); continuing with native Telethon media or text", media_err)
 
+        chat_title = getattr(chat, "username", getattr(chat, "title", chat_id))
+        log.info(
+            "Broadcasting deal from %s to %d subscribed user(s) independently...",
+            chat_title, len(subscribed_users)
+        )
+
+        # ------------------------------------------------------------------- #
+        # Multi-Tenant Independent User Broadcast Loop
+        # ------------------------------------------------------------------- #
+        delivered_count = 0
         try:
-            results = await asyncio.gather(
-                *(safe_post(bot, u, display_text, msg, media_path) for u in users),
-                return_exceptions=True,
-            )
-            ok = sum(1 for r in results if r is True)
-            chat_title = getattr(chat, "username", getattr(chat, "title", chat_id))
-            log.info("Post from %s fanned out: %d/%d delivered", chat_title, ok, len(users))
+            for u in subscribed_users:
+                try:
+                    log.info("Dispatching deal to user %s (target: %s)...", u.user_id, u.target_channel_id)
+                    success = await post_to_user(bot, u, display_text, msg, media_path)
+                    if success:
+                        delivered_count += 1
+                except Exception as user_err:
+                    log.error(
+                        "Independent delivery failed for user %s (%s): %s",
+                        getattr(u, "user_id", "unknown"),
+                        getattr(u, "target_channel_id", "unknown"),
+                        user_err,
+                        exc_info=True,
+                    )
+                    continue
+
+            log.info("Deal broadcast complete: %d/%d users successfully received post", delivered_count, len(subscribed_users))
         finally:
             if media_path and os.path.exists(media_path):
                 try:
@@ -3707,34 +3890,58 @@ async def refresh_configs() -> None:
         rows = await api_fetch_configs()
     except Exception as e:
         log.warning("Config sync failed: %s", e)
-        return
-
-    if rows is None:
-        log.warning("Config sync API error or timeout; retaining %d cached users & %d sources to avoid deal stoppage.", len(store.users), len(store.all_sources()))
-        return
-
-    if len(rows) == 0 and len(store.users) > 0:
-        log.warning("Config sync returned 0 rows but store currently has %d active users; retaining cached configurations.", len(store.users))
-        return
+        rows = None
 
     users: dict[str, UserConfig] = {}
-    for r in rows:
-        cfg = parse_config(r)
-        if cfg and cfg.is_active:
-            users[cfg.user_id] = cfg
-            if cfg.telegram_user_id:
-                _telegram_to_user_id[str(cfg.telegram_user_id)] = cfg.user_id
-                if cfg.tracking_sub_id:
-                    _telegram_to_sub_id[str(cfg.telegram_user_id)] = cfg.tracking_sub_id
-                if cfg.amazon_tag:
-                    _telegram_to_amazon_tag[str(cfg.telegram_user_id)] = cfg.amazon_tag
+    if rows and isinstance(rows, list):
+        for r in rows:
+            cfg = parse_config(r)
+            if cfg and cfg.is_active:
+                users[cfg.user_id] = cfg
+                if cfg.telegram_user_id:
+                    _telegram_to_user_id[str(cfg.telegram_user_id)] = cfg.user_id
+                    if cfg.tracking_sub_id:
+                        _telegram_to_sub_id[str(cfg.telegram_user_id)] = cfg.tracking_sub_id
+                    if cfg.amazon_tag:
+                        _telegram_to_amazon_tag[str(cfg.telegram_user_id)] = cfg.amazon_tag
+
+    # Merge with direct Supabase REST if available so no user configs are missed
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        try:
+            s = await http()
+            headers = {
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            }
+            url = f"{SUPABASE_URL}/rest/v1/TelegramChannelConfig?isActive=eq.true"
+            timeout = aiohttp.ClientTimeout(total=3.0)
+            async with s.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status == 200:
+                    sb_rows = await resp.json()
+                    if isinstance(sb_rows, list):
+                        for r in sb_rows:
+                            cfg = parse_config(r)
+                            if cfg and cfg.is_active and cfg.user_id not in users:
+                                users[cfg.user_id] = cfg
+                                if cfg.telegram_user_id:
+                                    _telegram_to_user_id[str(cfg.telegram_user_id)] = cfg.user_id
+                                    if cfg.tracking_sub_id:
+                                        _telegram_to_sub_id[str(cfg.telegram_user_id)] = cfg.tracking_sub_id
+                                    if cfg.amazon_tag:
+                                        _telegram_to_amazon_tag[str(cfg.telegram_user_id)] = cfg.amazon_tag
+        except Exception as sb_err:
+            log.debug("Supabase direct sync note: %s", sb_err)
 
     if users:
         store.replace(users)
         log.info("Config synced: %d active users, %d distinct sources: %s", len(users), len(store.all_sources()), list(store.all_sources())[:5])
         await session_mgr.sync_user_sessions(users)
     elif not store.users:
-        store.replace({})
+        if rows is None:
+            log.warning("Config sync API error or timeout; retaining %d cached users & %d sources to avoid deal stoppage.", len(store.users), len(store.all_sources()))
+        else:
+            store.replace({})
 
 
 async def config_sync_loop() -> None:
