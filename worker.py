@@ -1371,8 +1371,17 @@ async def convert_text(
             log.warning("Error in convert_text for URL %s: %s; applying fallback hyperlink", u, e)
             try:
                 fb_sub_id = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
-                if (is_amazon_url(u) or (target_url and is_amazon_url(target_url))) and amazon_tag:
-                    fb_url = clean_url_formatting(to_amazon_affiliate_url(target_url or u, amazon_tag, fallback_url=u, sub_id=fb_sub_id))
+                is_amz_fb = is_amazon_url(u) or (bool(target_url) and is_amazon_url(target_url))
+                if is_amz_fb:
+                    fb_url = clean_url_formatting(
+                        build_intelligent_amazon_url(
+                            target_url or u,
+                            custom_amazon_tag=amazon_tag,
+                            user_id=user_id,
+                            fallback_url=u,
+                            sub_id=fb_sub_id,
+                        )
+                    )
                 elif fb_sub_id:
                     fb_url = clean_url_formatting(to_cuelinks(u, fb_sub_id))
                 else:
@@ -2257,10 +2266,28 @@ async def cmd_start(message: Message, command: CommandObject = None, state: FSMC
         if is_success:
             asyncio.create_task(refresh_configs())
             sub_id_display = sub_id if sub_id else "Configured in Dashboard"
+            custom_tag = clean_amazon_associate_tag(
+                res.get("customAmazonTag")
+                or res.get("amazonTag")
+                or (res.get("user") or {}).get("customAmazonTag")
+                or (res.get("user") or {}).get("amazonTag")
+                or (cfg_rows[0].get("customAmazonTag") if cfg_rows else None)
+                or (cfg_rows[0].get("amazonTag") if cfg_rows else None)
+                or _telegram_to_amazon_tag.get(str(tg_user.id))
+                or ""
+            )
+            if custom_tag:
+                _telegram_to_amazon_tag[str(tg_user.id)] = custom_tag
+                amazon_tag_display = custom_tag
+            else:
+                effective_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
+                amazon_tag_display = f"kamaikaro02-21 (SubTag: {effective_sub})"
+
             await message.answer(
                 f"✅ <b>Account Connected Successfully!</b>\n\n"
                 f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
-                f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id_display}</code>\n\n"
+                f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id_display}</code>\n"
+                f"🏷️ <b>Amazon Tag:</b> <code>{amazon_tag_display}</code>\n\n"
                 "👉 Tap <b>[📱 Login Telegram Account]</b> below to link your Telegram session so KamaiKaro can access your channels:",
                 reply_markup=get_main_menu_keyboard(is_logged_in=False, is_linked=True),
                 parse_mode="HTML",
@@ -2297,11 +2324,19 @@ async def cmd_start(message: Message, command: CommandObject = None, state: FSMC
         if state:
             await state.update_data(user_id=stored_user_id)
         is_logged_in = bool(u_cfg and u_cfg.session_string)
-        sub_id = u_cfg.tracking_sub_id if u_cfg and u_cfg.tracking_sub_id else "Configured in Dashboard"
+        sub_id = u_cfg.tracking_sub_id if u_cfg and u_cfg.tracking_sub_id else (_telegram_to_sub_id.get(str(tg_user.id)) or "Configured in Dashboard")
+        custom_tag = clean_amazon_associate_tag((u_cfg.amazon_tag if u_cfg and u_cfg.amazon_tag else None) or _telegram_to_amazon_tag.get(str(tg_user.id)) or "")
+        effective_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=stored_user_id)
+        if custom_tag:
+            amazon_tag_display = custom_tag
+        else:
+            amazon_tag_display = f"kamaikaro02-21 (SubTag: {effective_sub})"
+
         await message.answer(
             f"👋 <b>Welcome back to KamaiKaro Deal Automation Bot!</b>\n\n"
             f"👤 <b>Linked User ID:</b> <code>{stored_user_id}</code>\n"
-            f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id}</code>\n\n"
+            f"🔗 <b>Your Tracking SubID:</b> <code>{sub_id}</code>\n"
+            f"🏷️ <b>Amazon Tag:</b> <code>{amazon_tag_display}</code>\n\n"
             "Select an option below to manage your automation:",
             reply_markup=get_main_menu_keyboard(is_logged_in=is_logged_in, is_linked=True),
             parse_mode="HTML",
@@ -3396,8 +3431,13 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
         target = (c.target_channel_name or c.target_channel_id) if c else "Not set"
         session_status = "🟢 Connected" if (c and c.session_string) else "🟡 Using Bot / Not Connected"
         sub_id_str = final_sub_id or "Not configured"
-        amazon_tag_str = (c.amazon_tag if c and c.amazon_tag else None) or _telegram_to_amazon_tag.get(str(tg_user.id)) or "None (Cuelinks routed)"
         user_id_str = (c.user_id if c else None) or _telegram_to_user_id.get(str(tg_user.id)) or state_data.get("user_id") or "Connected"
+        custom_tag = clean_amazon_associate_tag((c.amazon_tag if c and c.amazon_tag else None) or _telegram_to_amazon_tag.get(str(tg_user.id)) or "")
+        effective_sub = resolve_compact_sub_id(sub_id=final_sub_id, user_id=user_id_str)
+        if custom_tag:
+            amazon_tag_str = custom_tag
+        else:
+            amazon_tag_str = f"kamaikaro02-21 (SubTag: {effective_sub})"
         is_active = c.is_active if c else True
         source_channels = c.source_channels if c else []
 
