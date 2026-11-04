@@ -124,6 +124,32 @@ ALL_DOMAINS = tuple(set(d for ds in SUPPORTED_DOMAINS.values() for d in ds))
 URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 TRAILING_PUNCT = ".,;:!?)]}>'\""
 
+# Mock/auto-assigned source channels to discard on user init and cleanup
+MOCK_SOURCE_CHANNELS = {
+    "fashion_discount_hub",
+    "amazon_great_indian_deals",
+    "lootdealsindia",
+    "kamaikaro_hot_deals",
+    "flipkart_loot_offers",
+}
+
+
+def is_mock_channel(ch: Any) -> bool:
+    """Check if a channel identifier, dict, or username matches default/mock auto-assigned channels."""
+    if not ch:
+        return False
+    if isinstance(ch, dict):
+        uname = (ch.get("username") or "").lower().lstrip("@")
+        cid = str(ch.get("id") or ch.get("channelId") or "").lower().lstrip("@")
+        title = (ch.get("title") or "").lower().lstrip("@")
+        return (
+            uname in MOCK_SOURCE_CHANNELS
+            or cid in MOCK_SOURCE_CHANNELS
+            or title in MOCK_SOURCE_CHANNELS
+        )
+    s = str(ch).lower().lstrip("@")
+    return s in MOCK_SOURCE_CHANNELS
+
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
 
@@ -649,27 +675,43 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             else:
                 raw_sources = [x for x in re.split(r"[,\s]+", raw_sources) if x]
 
+        source_items = raw_sources if isinstance(raw_sources, list) else ([raw_sources] if raw_sources else [])
+
+        # Filter out mock channels and deduplicate raw objects
+        unique_raw_sources = []
+        seen_raw_keys = set()
+        for x in source_items:
+            if not x or is_mock_channel(x):
+                continue
+            if isinstance(x, dict):
+                key = str(x.get("id") or x.get("channelId") or x.get("username") or "").strip().lower()
+                if key and key not in seen_raw_keys:
+                    seen_raw_keys.add(key)
+                    unique_raw_sources.append(x)
+            else:
+                key = str(x).strip().lower()
+                if key and key not in seen_raw_keys:
+                    seen_raw_keys.add(key)
+                    unique_raw_sources.append(x)
+
+        # Build clean, unique source display names (1 entry per channel, no duplicates)
         source_names: list[str] = []
-        if isinstance(raw_sources, list):
-            for x in raw_sources:
-                if isinstance(x, dict):
-                    uname = x.get("username")
-                    cid = x.get("id") or x.get("channelId") or x.get("channel_id") or x.get("chat_id")
-                    if uname:
-                        source_names.append(str(uname))
-                    if cid is not None:
-                        source_names.append(str(cid))
-                elif x:
-                    source_names.append(str(x))
-        elif isinstance(raw_sources, dict):
-            uname = raw_sources.get("username")
-            cid = raw_sources.get("id") or raw_sources.get("channelId") or raw_sources.get("channel_id") or raw_sources.get("chat_id")
-            if uname:
-                source_names.append(str(uname))
-            if cid is not None:
-                source_names.append(str(cid))
-        elif raw_sources:
-            source_names.append(str(raw_sources))
+        for x in unique_raw_sources:
+            if isinstance(x, dict):
+                uname = (x.get("username") or "").strip()
+                title = (x.get("title") or x.get("name") or "").strip()
+                cid = x.get("id") or x.get("channelId") or x.get("channel_id") or x.get("chat_id")
+                if uname:
+                    source_names.append(f"@{uname.lstrip('@')}")
+                elif title:
+                    source_names.append(title)
+                elif cid is not None:
+                    source_names.append(str(cid))
+            else:
+                source_names.append(str(x).strip())
+
+        # Enforce strict uniqueness preserving order
+        source_names = list(dict.fromkeys(source_names))
 
         target_ch_list = raw.get("targetChannels") or []
         if isinstance(target_ch_list, str):
@@ -724,7 +766,7 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
             target_channel_name=primary_target_name,
             target_channels=list(target_ch_list) if isinstance(target_ch_list, list) else [],
             source_channels=source_names,
-            source_channels_raw=list(raw_sources) if isinstance(raw_sources, list) else ([raw_sources] if raw_sources else []),
+            source_channels_raw=unique_raw_sources,
             tracking_sub_id=parsed_sub_id,
             amazon_tag=parsed_amazon_tag,
             is_active=bool(raw.get("isActive", raw.get("is_active", True))),
@@ -732,6 +774,64 @@ def parse_config(raw: dict) -> Optional[UserConfig]:
     except Exception:
         log.exception("Bad config row skipped: %r", raw)
         return None
+
+
+async def cleanup_unconfigured_mock_channels(rows: list[dict]) -> None:
+    """Clean up existing database records where duplicate/default mock channels
+    were automatically injected, resetting unconfigured users to empty list.
+    """
+    if not rows or not isinstance(rows, list):
+        return
+    for r in rows:
+        try:
+            raw_sources = r.get("sourceChannels") or []
+            if isinstance(raw_sources, str):
+                try:
+                    raw_sources = json.loads(raw_sources)
+                except Exception:
+                    continue
+            if not isinstance(raw_sources, list) or not raw_sources:
+                continue
+
+            has_mock = any(is_mock_channel(x) for x in raw_sources)
+            if not has_mock:
+                continue
+
+            cleaned_sources = [x for x in raw_sources if not is_mock_channel(x)]
+            user_id = str(r.get("userId") or "")
+            tg_id = r.get("telegramUserId")
+            if not user_id or not tg_id:
+                continue
+
+            log.info(
+                "Cleaning mock channels for user %s (tg: %s). Old count: %d -> Cleaned: %d",
+                user_id, tg_id, len(raw_sources), len(cleaned_sources),
+            )
+
+            target_channels = r.get("targetChannels") or []
+            target_id = r.get("targetChannelId")
+            target_name = r.get("targetChannelName")
+
+            await api_save_channels(
+                telegram_user_id=tg_id,
+                source_channels=cleaned_sources,
+                target_channels=target_channels if isinstance(target_channels, list) else [],
+                target_channel_id=target_id,
+                target_channel_name=target_name,
+                user_id=user_id,
+            )
+            await api_save_user_config({
+                "userId": user_id,
+                "telegramUserId": str(tg_id),
+                "sourceChannels": cleaned_sources,
+                "targetChannels": target_channels if isinstance(target_channels, list) else [],
+                "targetChannelId": target_id,
+                "targetChannelName": target_name,
+                "isActive": True,
+            })
+            r["sourceChannels"] = cleaned_sources
+        except Exception as e:
+            log.warning("cleanup_unconfigured_mock_channels error for row: %s", e)
 
 
 _last_configs_fetch_time: float = 0.0
@@ -770,6 +870,7 @@ async def get_all_active_configs_from_db_and_cache(force_refresh: bool = False) 
                 if resp.status == 200:
                     rows = await resp.json()
                     if isinstance(rows, list):
+                        await cleanup_unconfigured_mock_channels(rows)
                         for r in rows:
                             cfg = parse_config(r)
                             if cfg and cfg.is_active:
@@ -788,6 +889,7 @@ async def get_all_active_configs_from_db_and_cache(force_refresh: bool = False) 
         try:
             api_rows = await api_fetch_configs()
             if api_rows and isinstance(api_rows, list):
+                await cleanup_unconfigured_mock_channels(api_rows)
                 for r in api_rows:
                     cfg = parse_config(r)
                     if cfg and cfg.is_active:
@@ -2540,6 +2642,8 @@ async def link_telegram_in_supabase(
             "userId": user_id,
             "telegramUserId": str(telegram_user_id),
             "telegramUsername": telegram_username or "",
+            "sourceChannels": [],
+            "targetChannels": [],
             "isActive": True,
         }
         async with s.post(post_url, headers=post_headers, json=post_payload, timeout=timeout) as post_resp:
@@ -2623,10 +2727,31 @@ async def cmd_start(message: Message, command: CommandObject = None, state: FSMC
 
         # Sync with backend API
         await api_verify_sync(user_id, telegram_chat_id, telegram_username)
+
+        # Preserve genuine channels if user already configured them, but ensure new users start strictly with []
+        existing_rows = await api_fetch_configs(user_id=user_id)
+        if not existing_rows and telegram_chat_id:
+            existing_rows = await api_fetch_configs(telegram_id=telegram_chat_id)
+
+        existing_sources = []
+        existing_targets = []
+        target_cid = None
+        target_cname = None
+        if existing_rows:
+            ex = existing_rows[0]
+            existing_sources = [s for s in (ex.get("sourceChannels") or []) if not is_mock_channel(s)]
+            existing_targets = ex.get("targetChannels") or []
+            target_cid = ex.get("targetChannelId")
+            target_cname = ex.get("targetChannelName")
+
         await api_save_user_config({
             "userId": user_id,
             "telegramUserId": str(telegram_chat_id),
             "telegramUsername": telegram_username,
+            "sourceChannels": existing_sources,
+            "targetChannels": existing_targets if isinstance(existing_targets, list) else [],
+            "targetChannelId": target_cid,
+            "targetChannelName": target_cname,
             "isActive": True,
         })
         asyncio.create_task(refresh_configs())
@@ -3484,7 +3609,10 @@ async def show_channel_hub(event: Message | CallbackQuery, state: FSMContext = N
         initial_targets = set()
         if u_cfg and u_cfg.source_channels:
             for s in u_cfg.source_channels:
-                initial_sources.add(norm_channel(s))
+                if not is_mock_channel(s):
+                    norm_s = norm_channel(s)
+                    if norm_s:
+                        initial_sources.add(norm_s)
         if u_cfg:
             if u_cfg.target_channel_id:
                 initial_targets.add(str(u_cfg.target_channel_id))
@@ -3735,31 +3863,55 @@ async def save_channels_handler(query: CallbackQuery, state: FSMContext = None) 
         if d.get("username"):
             dialog_map[norm_channel(d["username"])] = d
 
-    # Build source channel objects
+    # Build source channel objects with enforced uniqueness
     source_objs = []
+    seen_source_keys = set()
     for s in draft["sources"]:
-        d = dialog_map.get(s)
+        norm_s = norm_channel(s)
+        if not norm_s or is_mock_channel(norm_s):
+            continue
+        d = dialog_map.get(s) or dialog_map.get(norm_s)
         if d:
-            source_objs.append({"id": str(d["id"]), "title": d["title"], "username": d.get("username") or ""})
+            cid = str(d["id"])
+            uname = (d.get("username") or "").strip()
+            key = (cid or uname).lower()
+            if key not in seen_source_keys:
+                seen_source_keys.add(key)
+                source_objs.append({"id": cid, "title": d["title"], "username": uname})
         else:
-            source_objs.append({"id": s, "title": s, "username": s})
+            key = s.lower()
+            if key not in seen_source_keys:
+                seen_source_keys.add(key)
+                source_objs.append({"id": s, "title": s, "username": s})
 
-    # Build target channel objects
+    # Build target channel objects with enforced uniqueness
     target_objs = []
+    seen_target_keys = set()
     primary_target_id = None
     primary_target_name = None
     for t in draft["targets"]:
-        d = dialog_map.get(t)
+        norm_t = norm_channel(t)
+        if not norm_t:
+            continue
+        d = dialog_map.get(t) or dialog_map.get(norm_t)
         if d:
-            target_objs.append({"id": str(d["id"]), "title": d["title"], "username": d.get("username") or ""})
-            if not primary_target_id:
-                primary_target_id = str(d["id"])
-                primary_target_name = d["title"]
+            cid = str(d["id"])
+            uname = (d.get("username") or "").strip()
+            key = (cid or uname).lower()
+            if key not in seen_target_keys:
+                seen_target_keys.add(key)
+                target_objs.append({"id": cid, "title": d["title"], "username": uname})
+                if not primary_target_id:
+                    primary_target_id = cid
+                    primary_target_name = d["title"]
         else:
-            target_objs.append({"id": t, "title": t, "username": t})
-            if not primary_target_id:
-                primary_target_id = t
-                primary_target_name = t
+            key = t.lower()
+            if key not in seen_target_keys:
+                seen_target_keys.add(key)
+                target_objs.append({"id": t, "title": t, "username": t})
+                if not primary_target_id:
+                    primary_target_id = t
+                    primary_target_name = t
 
     res = await api_save_channels(
         telegram_user_id=tg_user_id,
@@ -3867,7 +4019,15 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
         else:
             amazon_tag_str = f"kamaikaro02-21 (SubTag: {effective_sub})"
         is_active = c.is_active if c else True
-        source_channels = c.source_channels if c else []
+        raw_sources = c.source_channels if c else []
+        unique_sources = list(dict.fromkeys(s for s in raw_sources if s and not is_mock_channel(s)))
+
+        if not unique_sources:
+            source_channels_line = "• <b>Source Channels:</b> None (Tap 'Select Channels' to choose)"
+        else:
+            source_items = "\n".join(f"  ▫️ {x}" for x in unique_sources[:12])
+            more_suffix = f"\n  <i>...and {len(unique_sources) - 12} more</i>" if len(unique_sources) > 12 else ""
+            source_channels_line = f"• <b>Source Channels:</b> {len(unique_sources)}\n{source_items}{more_suffix}"
 
         text = (
             "⚙️ <b>Automation Status</b>\n\n"
@@ -3877,9 +4037,7 @@ async def cmd_status(event: Message | CallbackQuery, state: FSMContext = None) -
             f"• <b>Amazon Tag:</b> <code>{amazon_tag_str}</code>\n"
             f"• <b>Telegram Account:</b> {session_status}\n"
             f"• <b>Target Channel:</b> <code>{target}</code>\n"
-            f"• <b>Source Channels:</b> {len(source_channels)}\n"
-            + (("\n".join(f"  ▫️ {x}" for x in source_channels[:8])) if source_channels else "  ▫️ None selected")
-            + ("\n  <i>...and more</i>" if len(source_channels) > 8 else "")
+            f"{source_channels_line}"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📢 Select Channels", callback_data="menu:channels")],
@@ -4045,6 +4203,7 @@ async def refresh_configs() -> None:
 
     users: dict[str, UserConfig] = {}
     if rows and isinstance(rows, list):
+        await cleanup_unconfigured_mock_channels(rows)
         for r in rows:
             cfg = parse_config(r)
             if cfg and cfg.is_active:
@@ -4071,6 +4230,7 @@ async def refresh_configs() -> None:
                 if resp.status == 200:
                     sb_rows = await resp.json()
                     if isinstance(sb_rows, list):
+                        await cleanup_unconfigured_mock_channels(sb_rows)
                         for r in sb_rows:
                             cfg = parse_config(r)
                             if cfg and cfg.is_active and cfg.user_id not in users:
