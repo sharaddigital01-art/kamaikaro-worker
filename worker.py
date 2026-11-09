@@ -1258,6 +1258,196 @@ async def api_shorten_link(
     return None
 
 
+def is_branded_shortlink(url: str) -> bool:
+    """Check if URL is already a store-branded or popular deal shortlink."""
+    if not url:
+        return False
+    branded_domains = (
+        "amazn.lt", "amzn.to", "amzn.in", "a.co", "amzn.cl", "amzn.eu",
+        "fkrt.co", "fkrt.it", "fkt.in",
+        "myntr.in", "myntr.it", "shopsy.in",
+        "bit.ly", "cutt.ly", "tinyurl.com", "t.ly",
+    )
+    try:
+        p = urllib.parse.urlparse(url.strip())
+        host = p.netloc.lower().split(":")[0]
+        return any(host == d or host.endswith("." + d) for d in branded_domains)
+    except Exception:
+        return False
+
+
+def get_branded_shortlink(
+    store: str = "",
+    original_url: str = "",
+    target_url: str = "",
+    slug: Optional[str] = None,
+) -> str:
+    """Generate or retain clean store-branded short URL format for the message body:
+    - Amazon: https://amazn.lt/{slug} or https://amzn.to/{slug} (or retained original)
+    - Flipkart: https://fkrt.co/{slug}
+    - Myntra: https://myntr.in/{slug}
+    - Shopsy: https://fkrt.co/{slug} or https://shopsy.in/{slug}
+    - Others: https://kamaikaro.in/l/{slug} or https://amazn.lt/{slug}
+    """
+    # 1. If original URL was already a branded shortlink, retain it directly
+    if original_url and is_branded_shortlink(original_url):
+        return original_url.strip()
+
+    # 2. Extract or generate slug if not provided
+    if not slug:
+        check_url = target_url or original_url
+        m_amz = re.search(r'(?:/dp/|/gp/product/|/d/|asin=)([A-Z0-9]{10})', check_url, re.I)
+        if m_amz:
+            slug = m_amz.group(1)[-6:].lower()
+        else:
+            m_fk = re.search(r'itm[a-z0-9]{6,16}', check_url, re.I)
+            if m_fk:
+                slug = m_fk.group(0)[-6:].lower()
+            else:
+                slug = hashlib.md5((check_url or "deal").encode("utf-8")).hexdigest()[:6]
+
+    store_lower = (store or "").lower()
+    if "amazon" in store_lower or "amz" in store_lower:
+        return f"https://amazn.lt/{slug}"
+    elif "flipkart" in store_lower or "shopsy" in store_lower:
+        return f"https://fkrt.co/{slug}"
+    elif "myntra" in store_lower:
+        return f"https://myntr.in/{slug}"
+    else:
+        return f"https://amazn.lt/{slug}"
+
+
+async def build_inbody_deal_caption(
+    text: str,
+    converted_deals: list[dict[str, Any]],
+    user_sub_id: str = "",
+    user_id: Optional[str] = None,
+) -> str:
+    """Format deal post into in-body branded shortlinks with zero buttons:
+    - Retains/generates clean store-branded shortlinks (amazn.lt, fkrt.co, myntr.in)
+    - Replaces target destination with monetized affiliate link wrapped via /api/r
+    - Preserves native text layout: '🔗 https://amazn.lt/xxxx' or '- https://fkrt.co/xxxx'
+    - Places deal link directly beneath the product title/discount line
+    - Strips external channel join promotions and spam
+    - Strictly prevents raw redirect URLs (e.g. linksredirect.com) from showing as bare text
+    """
+    if not text:
+        text = ""
+
+    promo_patterns = [
+        re.compile(r"^(?:join|follow|subscribe|more deals|more loots|updates on|channel)\b.*@\w+", re.I),
+        re.compile(r"^join\s+(?:our\s+)?(?:telegram|channel|group)\b.*$", re.I),
+        re.compile(r"^t\.me/[\w_]+(?:\s+for\s+more.*)?$", re.I),
+        re.compile(r"^forwarded\s+from\b.*$", re.I),
+        re.compile(r"^join\s+@\w+$", re.I),
+    ]
+
+    lines = [line.strip() for line in text.strip().splitlines()]
+    filtered_lines = [l for l in lines if not any(p.match(l) for p in promo_patterns)]
+    caption = "\n".join(filtered_lines).strip()
+
+    if not converted_deals:
+        caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
+        return caption
+
+    # Pre-fetch slugs from API for any unbranded full URLs in parallel
+    slug_map: dict[str, str] = {}
+    unbranded = [d for d in converted_deals if not is_branded_shortlink(d.get("original_url", ""))]
+    if unbranded and user_id:
+        try:
+            tasks = [
+                api_shorten_link(d["converted_url"], user_id=user_id, sub_id=user_sub_id)
+                for d in unbranded
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for d, res in zip(unbranded, results):
+                if isinstance(res, str) and res:
+                    m_slug = re.search(r"/(?:l/)?([a-zA-Z0-9_\-]+)$", res)
+                    if m_slug:
+                        slug_map[d["original_url"]] = m_slug.group(1)
+        except Exception as slug_err:
+            log.debug("Batch slug resolution error: %s", slug_err)
+
+    has_prefix_re = re.compile(r"^(?:👉|🛒|🛍️|🔗|⚡|🔥|📌|👉🏻|👉🏼|👉🏽|👉🏾|👉🏿|\*|•|-|–|—)\s*", re.I)
+
+    replaced_deals = set()
+
+    for d in converted_deals:
+        orig = d.get("original_url", "")
+        conv = d.get("converted_url", "")
+        target_url = d.get("target_url", "")
+        store = d.get("store", "Store")
+        target_dest = wrap_fast_redirect_url(conv, user_sub_id)
+        slug = slug_map.get(orig)
+        branded = get_branded_shortlink(store=store, original_url=orig, target_url=target_url, slug=slug)
+        html_link = f'<a href="{target_dest}">{branded}</a>'
+        store_lower = store.lower()
+        default_pfx = "- " if ("flipkart" in store_lower or "myntra" in store_lower or "shopsy" in store_lower) else "🔗 "
+
+        md_pattern = re.compile(r'\[([^\]]+)\]\(' + re.escape(orig) + r'\)')
+
+        lines_in_cap = caption.splitlines()
+        new_lines = []
+        deal_matched = False
+        for line in lines_in_cap:
+            line_str = line.strip()
+            if orig and md_pattern.search(line):
+                m_match = md_pattern.search(line)
+                if line_str == m_match.group(0):
+                    new_lines.append(f"{default_pfx}{html_link}")
+                else:
+                    new_lines.append(md_pattern.sub(html_link, line))
+                deal_matched = True
+                replaced_deals.add(orig)
+            elif orig and orig in line:
+                if line_str == orig:
+                    new_lines.append(f"{default_pfx}{html_link}")
+                else:
+                    replaced_line = line.replace(orig, html_link)
+                    if not has_prefix_re.match(line_str):
+                        new_lines.append(f"{default_pfx}{replaced_line}")
+                    else:
+                        new_lines.append(replaced_line)
+                deal_matched = True
+                replaced_deals.add(orig)
+            else:
+                new_lines.append(line)
+
+        if deal_matched:
+            caption = "\n".join(new_lines)
+
+    # Any deals not found in body text: append directly beneath product/price info
+    unplaced = [d for d in converted_deals if d.get("original_url") not in replaced_deals]
+    if unplaced:
+        add_lines = []
+        for d in unplaced:
+            store = d.get("store", "Store")
+            conv = d.get("converted_url", "")
+            target_dest = wrap_fast_redirect_url(conv, user_sub_id)
+            slug = slug_map.get(d.get("original_url", ""))
+            branded = get_branded_shortlink(store=store, original_url=d.get("original_url", ""), target_url=d.get("target_url", ""), slug=slug)
+            html_link = f'<a href="{target_dest}">{branded}</a>'
+            store_lower = store.lower()
+            if "flipkart" in store_lower or "myntra" in store_lower or "shopsy" in store_lower:
+                add_lines.append(f"- {html_link}")
+            else:
+                add_lines.append(f"🔗 {html_link}")
+        if caption:
+            caption = f"{caption}\n\n" + "\n".join(add_lines)
+        else:
+            caption = "\n".join(add_lines)
+
+    # Safety pass: Never output raw https://linksredirect.com/?... in Telegram channel post!
+    caption = re.sub(
+        r'(?<!href=")(?<!href=\')https://linksredirect\.com/[^\s<>"\')\]]+',
+        lambda m: f'<a href="{wrap_fast_redirect_url(m.group(0), user_sub_id)}">{get_branded_shortlink("Flipkart", m.group(0), "")}</a>',
+        caption,
+    )
+
+    caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
+    return caption
+
+
 def strip_deal_links_and_clean_caption(text: str) -> str:
     """Remove all deal links, markdown hyperlinks, and CTA phrases completely from caption text,
     leaving a 100% clean deal post (Title, Features, MRP, Deal Price, Discount) with ZERO text links.
@@ -2186,12 +2376,10 @@ async def bot_send_with_retry(
     caption: str,
     media_path: Optional[str],
     is_real_media: bool,
-    reply_markup: Optional[InlineKeyboardMarkup],
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
     max_retries: int = 2,
 ) -> bool:
-    """Send post to target channel via Aiogram Bot with retry logic and media fallback.
-    Uses standard native URL buttons strictly supported by Telegram Channels.
-    """
+    """Send post to target channel via Aiogram Bot with retry logic and media fallback."""
     for attempt in range(max_retries + 1):
         try:
             if is_real_media and media_path and os.path.exists(media_path):
@@ -2201,11 +2389,17 @@ async def bot_send_with_retry(
                         await bot.send_photo(target, file_input, caption=caption, reply_markup=reply_markup)
                         return True
                     except Exception as photo_err:
+                        if "can't parse entities" in str(photo_err).lower():
+                            try:
+                                await bot.send_photo(target, file_input, caption=re.sub(r"<[^>]+>", "", caption), reply_markup=reply_markup)
+                                return True
+                            except Exception:
+                                pass
                         try:
                             await bot.send_document(target, file_input, caption=caption, reply_markup=reply_markup)
                             return True
                         except Exception:
-                            log.warning("Bot media upload failed (%s); falling back to text message with buttons", photo_err)
+                            log.warning("Bot media upload failed (%s); falling back to text message", photo_err)
                 else:
                     try:
                         sent = await bot.send_photo(target, file_input)
@@ -2217,11 +2411,17 @@ async def bot_send_with_retry(
                             await bot.send_message(target, caption[:MESSAGE_LIMIT], reply_to_message_id=sent.message_id, reply_markup=reply_markup)
                             return True
                         except Exception:
-                            log.warning("Bot media chunked send failed; falling back to text message with buttons")
+                            log.warning("Bot media chunked send failed; falling back to text message")
 
             # Text-only send (or media fallback)
-            await bot.send_message(target, caption[:MESSAGE_LIMIT], reply_markup=reply_markup)
-            return True
+            try:
+                await bot.send_message(target, caption[:MESSAGE_LIMIT], reply_markup=reply_markup)
+                return True
+            except Exception as txt_err:
+                if "can't parse entities" in str(txt_err).lower():
+                    await bot.send_message(target, re.sub(r"<[^>]+>", "", caption[:MESSAGE_LIMIT]), reply_markup=reply_markup)
+                    return True
+                raise txt_err
 
         except Exception as e:
             err_str = str(e)
@@ -2246,35 +2446,35 @@ async def telethon_send_with_retry(
     media: Any,
     media_path: Optional[str],
     is_real_media: bool,
-    buttons: Any,
+    buttons: Any = None,
     max_retries: int = 2,
 ) -> bool:
-    """Send post via Telethon client with retry logic and clean caption (zero text links)."""
+    """Send post via Telethon client with retry logic and HTML caption support."""
     for attempt in range(max_retries + 1):
         try:
             file_to_send = media if media else (media_path if media_path and os.path.exists(media_path) else None)
             if is_real_media and file_to_send:
                 if len(caption) <= CAPTION_LIMIT:
                     try:
-                        await u_client.send_file(target, file=file_to_send, caption=caption, buttons=buttons)
+                        await u_client.send_file(target, file=file_to_send, caption=caption, parse_mode="html", buttons=buttons)
                         return True
-                    except Exception as btn_err:
-                        log.debug("Telethon send_file with buttons failed (%s); trying without buttons", btn_err)
-                        await u_client.send_file(target, file=file_to_send, caption=caption)
+                    except Exception as parse_err:
+                        log.debug("Telethon send_file with html parse failed (%s); trying raw text", parse_err)
+                        await u_client.send_file(target, file=file_to_send, caption=re.sub(r"<[^>]+>", "", caption), buttons=buttons)
                         return True
                 else:
                     sent_media = await u_client.send_file(target, file=file_to_send)
                     reply_id = getattr(sent_media, "id", None)
                     try:
-                        await u_client.send_message(target, caption[:MESSAGE_LIMIT], reply_to=reply_id, buttons=buttons)
+                        await u_client.send_message(target, caption[:MESSAGE_LIMIT], reply_to=reply_id, parse_mode="html", buttons=buttons)
                     except Exception:
-                        await u_client.send_message(target, caption[:MESSAGE_LIMIT], reply_to=reply_id)
+                        await u_client.send_message(target, re.sub(r"<[^>]+>", "", caption[:MESSAGE_LIMIT]), reply_to=reply_id, buttons=buttons)
                     return True
             else:
                 try:
-                    await u_client.send_message(target, caption[:MESSAGE_LIMIT], buttons=buttons)
+                    await u_client.send_message(target, caption[:MESSAGE_LIMIT], parse_mode="html", buttons=buttons)
                 except Exception:
-                    await u_client.send_message(target, caption[:MESSAGE_LIMIT])
+                    await u_client.send_message(target, re.sub(r"<[^>]+>", "", caption[:MESSAGE_LIMIT]), buttons=buttons)
                 return True
 
         except FloodWaitError as fw:
@@ -2304,31 +2504,15 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
     # 2. Extract and convert deal URLs (Amazon tag / Cuelinks)
     converted_deals = await resolve_and_convert_deals(text, sub_id=compact_sub_id, user_id=uid, amazon_tag=amazon_tag)
 
-    # 3. Clean up caption completely: remove all URLs, Markdown hyperlinks,
-    # and CTA lines so caption is 100% clean (Title, Features, MRP, Deal Price, Discount).
-    # ZERO text links in caption - all deal links MUST exist only on the native inline button below.
-    clean_caption = strip_deal_links_and_clean_caption(text)
+    # 3. Build in-body branded shortlinks caption (Zero-Button Format)
+    user_sub_id = compact_sub_id or getattr(user, "tracking_sub_id", "") or uid
+    clean_caption = await build_inbody_deal_caption(text, converted_deals, user_sub_id=user_sub_id, user_id=uid)
     if not clean_caption.strip():
         clean_caption = "🔥 Special Deal Offer"
 
-    # 4. Build official channel-supported inline keyboard markup (Native URL buttons)
+    # 4. Zero inline keyboard buttons - all deals are clickable in-body shortlinks
     aiogram_reply_markup = None
-    telethon_buttons = []
-    if converted_deals:
-        keyboard_rows = []
-        user_sub_id = compact_sub_id or getattr(user, "tracking_sub_id", "") or uid
-        for d in converted_deals:
-            target_url = d["converted_url"]
-            store = d.get("store", "Store")
-            is_amz = bool(d.get("is_amz"))
-            btn_text = d.get("btn_label") or get_deal_button_label(store=store, is_amz=is_amz, url=target_url)
-
-            # Fast-Redirect URL wrapper for real-time click counting: https://kamaikaro.in/api/r
-            button_url = f"https://kamaikaro.in/api/r?url={urllib.parse.quote_plus(target_url)}&subid={user_sub_id}"
-
-            keyboard_rows.append([make_aiogram_deal_button(btn_text, button_url)])
-            telethon_buttons.append([make_telethon_deal_button(btn_text, button_url)])
-        aiogram_reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    telethon_buttons = None
 
     # 5. Resolve user's target channels
     targets = []
@@ -2352,14 +2536,14 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
 
     u_client = await session_mgr.get_client_for_telegram_id(user.telegram_user_id)
 
-    # 6. Post to each target channel using Dual-Mode Delivery with Retry Logic
+    # 6. Post to each target channel using Dual-Mode Delivery with Retry Logic (Zero-Button Format)
     any_posted = False
     for target in targets:
         posted = False
 
         # ------------------------------------------------------------------- #
         # MODE 1: Official Bot Token Delivery (Primary)
-        # Uses native Telegram URL inline buttons - supported by all channels
+        # In-body branded shortlinks (Zero-Button Format)
         # ------------------------------------------------------------------- #
         if bot and BOT_TOKEN:
             try:
@@ -2369,7 +2553,7 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
                     caption=clean_caption,
                     media_path=media_path,
                     is_real_media=is_real_media,
-                    reply_markup=aiogram_reply_markup,
+                    reply_markup=None,
                 )
                 if not posted:
                     err_msg = "Bot Token posting returned False"
@@ -2379,6 +2563,7 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
 
         # ------------------------------------------------------------------- #
         # MODE 2: Telethon User Client Delivery (Fallback)
+        # In-body branded shortlinks (Zero-Button Format)
         # ------------------------------------------------------------------- #
         if not posted and u_client and u_client.is_connected():
             try:
@@ -2389,7 +2574,7 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
                     media=getattr(msg, "media", None),
                     media_path=media_path,
                     is_real_media=is_real_media,
-                    buttons=telethon_buttons if telethon_buttons else None,
+                    buttons=None,
                 )
                 if not posted:
                     err_msg = "Telethon User Client posting returned False"
