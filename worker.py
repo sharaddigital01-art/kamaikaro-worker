@@ -1317,39 +1317,67 @@ def get_branded_shortlink(
         return f"https://amazn.lt/{slug}"
 
 
-def get_deal_action_label(store: str = "", is_amz: bool = False, url: str = "") -> str:
-    """Get clean action text label for hyperlink (not a naked URL to avoid Telegram warning dialog):
-    - For Amazon deals: Buy on Amazon
-    - For Flipkart deals: Buy on Flipkart
-    - For Myntra deals: Buy on Myntra
-    - For other stores: Grab Offer Here
+def get_native_deal_link(
+    store: str = "",
+    is_amz: bool = False,
+    original_url: str = "",
+    converted_url: str = "",
+    target_url: str = "",
+    user_sub_id: str = "",
+    custom_amazon_tag: str = "",
+) -> str:
+    """Generate a native store-branded plain-text shortlink with tracking baked in.
+    Zero kamaikaro.in domain. Visible URL = actual destination.
+
+    - Amazon: amzn.to/{ASIN}?tag={tag}&ascsubtag={subid}
+      (amzn.to accepts query params and passes them through to Amazon)
+    - Flipkart: fkrt.co/{slug}  (retained original if branded, else converted_url)
+    - Myntra: myntr.in/{slug}  (retained original if branded, else converted_url)
+    - Others: original branded shortlink or converted_url
     """
-    if is_amz:
-        return "Buy on Amazon"
+    # ------------------------------------------------------------------ #
+    # Amazon: build amzn.to/{ASIN}?tag=...&ascsubtag=...                 #
+    # amzn.to shortlinks accept and preserve query parameters            #
+    # ------------------------------------------------------------------ #
+    if is_amz or "amazon" in (store or "").lower():
+        asin = (
+            extract_amazon_asin(converted_url)
+            or extract_amazon_asin(target_url)
+            or extract_amazon_asin(original_url)
+        )
+        master_tag = clean_amazon_associate_tag(AMAZON_ASSOCIATE_TAG) or "kamaikaro02-21"
+        use_tag = clean_amazon_associate_tag(custom_amazon_tag) or master_tag
+        sub_part = f"&ascsubtag={user_sub_id}" if (not custom_amazon_tag and user_sub_id) else ""
+        if asin:
+            return f"https://amzn.to/{asin}?tag={use_tag}{sub_part}"
+        # Fallback: return converted_url which already has correct params
+        return clean_url_formatting(converted_url) if converted_url else original_url
 
+    # ------------------------------------------------------------------ #
+    # Non-Amazon: retain original branded shortlink (fkrt.co, myntr.in) #
+    # It opens the native store app with zero popups                     #
+    # ------------------------------------------------------------------ #
+    if original_url and is_branded_shortlink(original_url):
+        return original_url.strip()
+
+    # If we got a Cuelinks converted_url, use it — Cuelinks shortens it
+    # and the final URL eventually resolves to the merchant, but the
+    # linksredirect domain would show. Use the kamaikaro short link
+    # instead (returned by api_shorten_link). Callers must pass it via
+    # the short_url field if available; otherwise fall back to converted_url.
+    return clean_url_formatting(converted_url) if converted_url else original_url
+
+
+def get_deal_link_prefix(store: str = "", is_amz: bool = False) -> str:
+    """Return the appropriate emoji/text prefix for a plain-text deal link line."""
     store_lower = (store or "").lower()
-    if "amazon" in store_lower or "amz" in store_lower:
-        return "Buy on Amazon"
-    if "flipkart" in store_lower or "fkrt" in store_lower:
-        return "Buy on Flipkart"
-    if "myntra" in store_lower or "myntr" in store_lower:
-        return "Buy on Myntra"
-    if "shopsy" in store_lower:
-        return "Buy on Shopsy"
-
-    # Domain check as fallback
-    if url:
-        u_lower = url.lower()
-        if any(d in u_lower for d in ("amazon.", "amazn.lt", "amzn.to", "amzn.in", "a.co")):
-            return "Buy on Amazon"
-        if any(d in u_lower for d in ("flipkart.", "fkrt.co", "fkrt.it", "fkt.in")):
-            return "Buy on Flipkart"
-        if any(d in u_lower for d in ("myntra.", "myntr.in", "myntr.it")):
-            return "Buy on Myntra"
-        if "shopsy." in u_lower:
-            return "Buy on Shopsy"
-
-    return "Grab Offer Here"
+    if is_amz or "amazon" in store_lower:
+        return "🔗 "
+    if "flipkart" in store_lower or "shopsy" in store_lower:
+        return "- "
+    if "myntra" in store_lower:
+        return "- "
+    return "🔗 "
 
 
 def is_link_line_only(line: str, url: str, md_match_text: Optional[str] = None) -> bool:
@@ -1375,17 +1403,17 @@ async def build_inbody_deal_caption(
     converted_deals: list[dict[str, Any]],
     user_sub_id: str = "",
     user_id: Optional[str] = None,
+    custom_amazon_tag: str = "",
 ) -> str:
-    """Format deal post into in-body action text hyperlinks (Zero Warning Popup) with zero buttons:
-    - Formats deal links as action text hyperlinks:
-      - Amazon: 👉 <a href="{tracking_url}">Buy on Amazon</a>
-      - Flipkart: 👉 <a href="{tracking_url}">Buy on Flipkart</a>
-      - Myntra: 👉 <a href="{tracking_url}">Buy on Myntra</a>
-      - Other stores: 👉 <a href="{tracking_url}">Grab Offer Here</a>
-    - Eliminates naked store URLs in anchor text to prevent Telegram's anti-phishing warning dialog
-    - Places action line cleanly below the product title and deal price lines
+    """Format deal post with native store-branded plain-text shortlinks (Zero Warning Popup, Zero Buttons):
+    - Amazon: 🔗 https://amzn.to/{ASIN}?tag=kamaikaro02-21&ascsubtag={subid}
+    - Flipkart: - https://fkrt.co/{slug}
+    - Myntra: - https://myntr.in/{slug}
+    - Others: 🔗 {short_url}
+    - Visible URL = actual destination (no kamaikaro.in wrapper, no anti-phishing popup)
+    - Places deal link directly beneath the product title/discount line
     - Strips external channel join promotions and spam
-    - Strictly prevents raw redirect URLs (e.g. linksredirect.com) from showing as bare text
+    - Strictly prevents raw linksredirect.com from showing as bare text
     """
     if not text:
         text = ""
@@ -1406,6 +1434,28 @@ async def build_inbody_deal_caption(
         caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
         return caption
 
+    # Pre-fetch short URLs from api_shorten_link for non-Amazon, non-branded deals in parallel
+    short_url_map: dict[str, str] = {}
+    need_shortening = [
+        d for d in converted_deals
+        if not d.get("is_amz")
+        and not is_branded_shortlink(d.get("original_url", ""))
+        and d.get("converted_url", "")
+        and user_id
+    ]
+    if need_shortening:
+        try:
+            tasks = [
+                api_shorten_link(d["converted_url"], user_id=user_id, sub_id=user_sub_id)
+                for d in need_shortening
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for d, res in zip(need_shortening, results):
+                if isinstance(res, str) and res:
+                    short_url_map[d["original_url"]] = res
+        except Exception as short_err:
+            log.debug("Batch short URL resolution error: %s", short_err)
+
     replaced_deals = set()
 
     for d in converted_deals:
@@ -1414,11 +1464,27 @@ async def build_inbody_deal_caption(
         target_url = d.get("target_url", "")
         store = d.get("store", "Store")
         is_amz = bool(d.get("is_amz"))
-        target_dest = wrap_fast_redirect_url(conv, user_sub_id)
-        action_label = get_deal_action_label(store=store, is_amz=is_amz, url=target_url or orig)
 
-        action_line = f'👉 <a href="{target_dest}">{action_label}</a>'
-        inline_action_link = f'<a href="{target_dest}">{action_label}</a>'
+        # Build the native trackable plain-text URL (no kamaikaro wrapper)
+        # For non-Amazon: prefer api-shortened link over raw linksredirect URL
+        if is_amz:
+            native_url = get_native_deal_link(
+                store=store, is_amz=is_amz, original_url=orig, converted_url=conv,
+                target_url=target_url, user_sub_id=user_sub_id, custom_amazon_tag=custom_amazon_tag,
+            )
+        else:
+            # Prefer: original branded shortlink → api short URL → converted_url
+            if is_branded_shortlink(orig):
+                native_url = orig.strip()
+            elif orig in short_url_map:
+                native_url = short_url_map[orig]
+            else:
+                # Last resort: use original branded source link or converted_url
+                # but never expose raw linksredirect URL as visible text
+                native_url = orig if is_branded_shortlink(orig) else conv
+
+        pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
+        deal_line = f"{pfx}{native_url}"
 
         md_pattern = re.compile(r'\[([^\]]+)\]\(' + re.escape(orig) + r'\)')
 
@@ -1426,20 +1492,19 @@ async def build_inbody_deal_caption(
         new_lines = []
         deal_matched = False
         for line in lines_in_cap:
-            line_str = line.strip()
             md_match = md_pattern.search(line)
             if orig and md_match:
                 if is_link_line_only(line, orig, md_match.group(0)):
-                    new_lines.append(action_line)
+                    new_lines.append(deal_line)
                 else:
-                    new_lines.append(md_pattern.sub(inline_action_link, line))
+                    new_lines.append(md_pattern.sub(native_url, line))
                 deal_matched = True
                 replaced_deals.add(orig)
             elif orig and orig in line:
                 if is_link_line_only(line, orig):
-                    new_lines.append(action_line)
+                    new_lines.append(deal_line)
                 else:
-                    new_lines.append(line.replace(orig, inline_action_link))
+                    new_lines.append(line.replace(orig, native_url))
                 deal_matched = True
                 replaced_deals.add(orig)
             else:
@@ -1458,23 +1523,34 @@ async def build_inbody_deal_caption(
             conv = d.get("converted_url", "")
             target_url = d.get("target_url", "")
             orig = d.get("original_url", "")
-            target_dest = wrap_fast_redirect_url(conv, user_sub_id)
-            action_label = get_deal_action_label(store=store, is_amz=is_amz, url=target_url or orig)
-            add_lines.append(f'👉 <a href="{target_dest}">{action_label}</a>')
+            if is_amz:
+                native_url = get_native_deal_link(
+                    store=store, is_amz=is_amz, original_url=orig, converted_url=conv,
+                    target_url=target_url, user_sub_id=user_sub_id, custom_amazon_tag=custom_amazon_tag,
+                )
+            else:
+                if is_branded_shortlink(orig):
+                    native_url = orig.strip()
+                elif orig in short_url_map:
+                    native_url = short_url_map[orig]
+                else:
+                    native_url = orig if is_branded_shortlink(orig) else conv
+            pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
+            add_lines.append(f"{pfx}{native_url}")
         if caption:
             caption = f"{caption}\n\n" + "\n".join(add_lines)
         else:
             caption = "\n".join(add_lines)
 
-    # Safety pass: Never output raw https://linksredirect.com/?... in Telegram channel post!
+    # Safety pass: strip any bare linksredirect.com URLs that slipped through
     caption = re.sub(
         r'(?<!href=")(?<!href=\')https://linksredirect\.com/[^\s<>"\')\]]+',
-        lambda m: f'👉 <a href="{wrap_fast_redirect_url(m.group(0), user_sub_id)}">Grab Offer Here</a>',
+        "[Deal Link]",
         caption,
     )
 
-    # Ensure action line stands out with clean paragraph separation below title/price lines
-    caption = re.sub(r"([^\n])\n(👉 <a href=)", r"\1\n\n\2", caption)
+    # Ensure deal line has clean paragraph separation below title/price lines
+    caption = re.sub(r"([^\n])\n((?:🔗 |- )https://)", r"\1\n\n\2", caption)
     caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
     return caption
 
@@ -2410,49 +2486,37 @@ async def bot_send_with_retry(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     max_retries: int = 2,
 ) -> bool:
-    """Send post to target channel via Aiogram Bot with retry logic and media fallback."""
+    """Send post to target channel via Aiogram Bot with retry logic and plain-text caption."""
     for attempt in range(max_retries + 1):
         try:
             if is_real_media and media_path and os.path.exists(media_path):
                 file_input = FSInputFile(media_path)
                 if len(caption) <= CAPTION_LIMIT:
                     try:
-                        await bot.send_photo(target, file_input, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+                        await bot.send_photo(target, file_input, caption=caption, parse_mode=None, reply_markup=reply_markup)
                         return True
                     except Exception as photo_err:
-                        if "can't parse entities" in str(photo_err).lower():
-                            try:
-                                await bot.send_photo(target, file_input, caption=re.sub(r"<[^>]+>", "", caption), parse_mode=None, reply_markup=reply_markup)
-                                return True
-                            except Exception:
-                                pass
                         try:
-                            await bot.send_document(target, file_input, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+                            await bot.send_document(target, file_input, caption=caption, parse_mode=None, reply_markup=reply_markup)
                             return True
                         except Exception:
                             log.warning("Bot media upload failed (%s); falling back to text message", photo_err)
                 else:
                     try:
                         sent = await bot.send_photo(target, file_input)
-                        await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode="HTML", reply_to_message_id=sent.message_id, reply_markup=reply_markup)
+                        await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=None, reply_to_message_id=sent.message_id, reply_markup=reply_markup)
                         return True
                     except Exception:
                         try:
                             sent = await bot.send_document(target, file_input)
-                            await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode="HTML", reply_to_message_id=sent.message_id, reply_markup=reply_markup)
+                            await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=None, reply_to_message_id=sent.message_id, reply_markup=reply_markup)
                             return True
                         except Exception:
                             log.warning("Bot media chunked send failed; falling back to text message")
 
             # Text-only send (or media fallback)
-            try:
-                await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode="HTML", reply_markup=reply_markup)
-                return True
-            except Exception as txt_err:
-                if "can't parse entities" in str(txt_err).lower():
-                    await bot.send_message(target, re.sub(r"<[^>]+>", "", caption[:MESSAGE_LIMIT]), parse_mode=None, reply_markup=reply_markup)
-                    return True
-                raise txt_err
+            await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=None, reply_markup=reply_markup)
+            return True
 
         except Exception as e:
             err_str = str(e)
@@ -2480,32 +2544,21 @@ async def telethon_send_with_retry(
     buttons: Any = None,
     max_retries: int = 2,
 ) -> bool:
-    """Send post via Telethon client with retry logic and HTML caption support."""
+    """Send post via Telethon client with retry logic and plain-text caption support."""
     for attempt in range(max_retries + 1):
         try:
             file_to_send = media if media else (media_path if media_path and os.path.exists(media_path) else None)
             if is_real_media and file_to_send:
                 if len(caption) <= CAPTION_LIMIT:
-                    try:
-                        await u_client.send_file(target, file=file_to_send, caption=caption, parse_mode="html", buttons=buttons)
-                        return True
-                    except Exception as parse_err:
-                        log.debug("Telethon send_file with html parse failed (%s); trying raw text", parse_err)
-                        await u_client.send_file(target, file=file_to_send, caption=re.sub(r"<[^>]+>", "", caption), buttons=buttons)
-                        return True
+                    await u_client.send_file(target, file=file_to_send, caption=caption, buttons=buttons)
+                    return True
                 else:
                     sent_media = await u_client.send_file(target, file=file_to_send)
                     reply_id = getattr(sent_media, "id", None)
-                    try:
-                        await u_client.send_message(target, caption[:MESSAGE_LIMIT], reply_to=reply_id, parse_mode="html", buttons=buttons)
-                    except Exception:
-                        await u_client.send_message(target, re.sub(r"<[^>]+>", "", caption[:MESSAGE_LIMIT]), reply_to=reply_id, buttons=buttons)
+                    await u_client.send_message(target, caption[:MESSAGE_LIMIT], reply_to=reply_id, buttons=buttons)
                     return True
             else:
-                try:
-                    await u_client.send_message(target, caption[:MESSAGE_LIMIT], parse_mode="html", buttons=buttons)
-                except Exception:
-                    await u_client.send_message(target, re.sub(r"<[^>]+>", "", caption[:MESSAGE_LIMIT]), buttons=buttons)
+                await u_client.send_message(target, caption[:MESSAGE_LIMIT], buttons=buttons)
                 return True
 
         except FloodWaitError as fw:
@@ -2535,9 +2588,14 @@ async def post_to_user(bot: Bot, user: UserConfig, text: str, msg: Any, media_pa
     # 2. Extract and convert deal URLs (Amazon tag / Cuelinks)
     converted_deals = await resolve_and_convert_deals(text, sub_id=compact_sub_id, user_id=uid, amazon_tag=amazon_tag)
 
-    # 3. Build in-body branded shortlinks caption (Zero-Button Format)
+    # 3. Build native store-branded plain-text shortlinks caption (Zero-Button, Zero kamaikaro wrapper)
     user_sub_id = compact_sub_id or getattr(user, "tracking_sub_id", "") or uid
-    clean_caption = await build_inbody_deal_caption(text, converted_deals, user_sub_id=user_sub_id, user_id=uid)
+    clean_caption = await build_inbody_deal_caption(
+        text, converted_deals,
+        user_sub_id=user_sub_id,
+        user_id=uid,
+        custom_amazon_tag=amazon_tag or "",
+    )
     if not clean_caption.strip():
         clean_caption = "🔥 Special Deal Offer"
 
