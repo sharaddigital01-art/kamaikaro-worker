@@ -1418,6 +1418,32 @@ async def build_inbody_deal_caption(
     if not text:
         text = ""
 
+    # ------------------------------------------------------------------ #
+    # Pre-process: extract href URLs from HTML anchors and markdown links  #
+    # so the deal loop can locate and monetize them normally.              #
+    #                                                                      #
+    # <a href="URL">any inner text</a>  →  URL                            #
+    # [any inner text](URL)             →  URL                            #
+    #                                                                      #
+    # This prevents anchor stripping from wiping URLs (e.g. Ajio/Myntra   #
+    # channels that send HTML-formatted posts with [Deal Link] anchors).  #
+    # ------------------------------------------------------------------ #
+    # HTML anchor: <a href="...">...</a>  (single/double quotes, optional spaces)
+    text = re.sub(
+        r'<a\s+href=["\']([^"\'>\s]+)["\'][^>]*>.*?</a>',
+        lambda m: m.group(1),
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Markdown hyperlink: [inner text](URL) — keep only the URL
+    text = re.sub(
+        r'\[([^\]]*)\]\((https?://[^\s)]+)\)',
+        lambda m: m.group(2),
+        text,
+    )
+    # Strip any remaining stray HTML tags (bold, italic, etc.) — NOT anchors (already handled above)
+    text = re.sub(r'</?(?:b|i|u|s|em|strong|br|p|span|div)[^>]*>', '', text, flags=re.IGNORECASE)
+
     promo_patterns = [
         re.compile(r"^(?:join|follow|subscribe|more deals|more loots|updates on|channel)\b.*@\w+", re.I),
         re.compile(r"^join\s+(?:our\s+)?(?:telegram|channel|group)\b.*$", re.I),
@@ -1543,11 +1569,14 @@ async def build_inbody_deal_caption(
             caption = "\n".join(add_lines)
 
     # Safety pass: strip any bare linksredirect.com URLs that slipped through
+    # (these are raw Cuelinks redirect URLs — never expose to users as plain text)
     caption = re.sub(
         r'(?<!href=")(?<!href=\')https://linksredirect\.com/[^\s<>"\')\]]+',
-        "[Deal Link]",
+        "",
         caption,
     )
+    # Also remove any orphaned "[Deal Link]" placeholder text with no URL following it
+    caption = re.sub(r'\[Deal Link\]\s*(?!\(https?://)', '', caption)
 
     # Ensure deal line has clean paragraph separation below title/price lines
     caption = re.sub(r"([^\n])\n((?:🔗 |- )https://)", r"\1\n\n\2", caption)
