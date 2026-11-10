@@ -91,7 +91,7 @@ CHANNELS_URL = f"{BASE_WEB_URL}/api/telegram/channels"
 SHORTENER_DOMAINS = (
     "amazn.lt", "amzn.to", "amzn.in", "amzn.cl", "amzn.eu", "a.co",
     "fkrt.it", "fkrt.co", "fkrt.cc", "fkt.in", "dl.flipkart.com",
-    "myntr.it", "ajio.page.link", "ajiio.in",
+    "myntr.it", "myntr.in", "ajio.page.link", "ajiio.in",
     "bit.ly", "bitly.com", "tinyurl.com", "cutt.ly", "t.co", "rb.gy",
     "shorturl.at", "shorturl.ac", "is.gd", "t.ly", "v.gd", "buff.ly",
     "ow.ly", "clk.im", "trib.al", "ift.tt", "goo.gl", "cleanuri.com",
@@ -115,8 +115,9 @@ EXCLUDED_DOMAINS = (
 SUPPORTED_DOMAINS = {
     "amazon": ("amazon.in", "amazon.com", "amazn.lt", "amzn.to", "amzn.in", "a.co", "amzn.cl", "amzn.eu"),
     "flipkart": ("flipkart.com", "fkrt.it", "fkrt.co", "fkrt.cc", "fkt.in", "dl.flipkart.com"),
-    "myntra": ("myntra.com", "myntr.it"),
+    "myntra": ("myntra.com", "myntr.it", "myntr.in"),
     "ajio": ("ajio.com", "ajiio.in", "ajio.page.link"),
+    "shopsy": ("shopsy.in", "shopsy.com"),
     "stores": STORE_DOMAINS,
     "shorteners": SHORTENER_DOMAINS,
 }
@@ -1080,10 +1081,21 @@ def resolve_compact_sub_id(sub_id: Optional[str] = None, user_id: Optional[str] 
 
 
 def to_cuelinks(url: str, sub_id: str) -> str:
-    clean = strip_affiliate_params(clean_url_formatting(url))
-    encoded_target_url = quote(clean, safe="")
+    clean = clean_url_formatting(url)
+    if not clean:
+        return ""
+    if "linksredirect.com" in clean:
+        try:
+            parsed = urllib.parse.urlparse(clean)
+            qs = urllib.parse.parse_qs(parsed.query)
+            if "url" in qs and qs["url"]:
+                clean = qs["url"][0]
+        except Exception:
+            pass
+    clean = strip_affiliate_params(clean) or clean
+    encoded_target_url = urllib.parse.quote_plus(clean)
     compact_sub_id = resolve_compact_sub_id(sub_id=sub_id)
-    raw_cuelink = f"https://linksredirect.com/?pub_id={CUELINKS_PUB_ID}&chnl_id={CUELINKS_CHNL_ID}&subid={compact_sub_id}&url={encoded_target_url}"
+    raw_cuelink = f"https://linksredirect.com/?cid={CUELINKS_PUB_ID}&chnl_id={CUELINKS_CHNL_ID}&subid={compact_sub_id}&url={encoded_target_url}"
     return clean_url_formatting(raw_cuelink)
 
 
@@ -1354,18 +1366,18 @@ def get_native_deal_link(
         return clean_url_formatting(converted_url) if converted_url else original_url
 
     # ------------------------------------------------------------------ #
-    # Non-Amazon: retain original branded shortlink (fkrt.co, myntr.in) #
-    # It opens the native store app with zero popups                     #
+    # Non-Amazon: Affiliate Conversion Pipeline                           #
+    # Cuelinks wrapper -> Kamaikaro real-time click tracking router       #
     # ------------------------------------------------------------------ #
-    if original_url and is_branded_shortlink(original_url):
-        return original_url.strip()
+    if converted_url and "kamaikaro.in/api/r" in converted_url:
+        return clean_url_formatting(converted_url)
 
-    # If we got a Cuelinks converted_url, use it — Cuelinks shortens it
-    # and the final URL eventually resolves to the merchant, but the
-    # linksredirect domain would show. Use the kamaikaro short link
-    # instead (returned by api_shorten_link). Callers must pass it via
-    # the short_url field if available; otherwise fall back to converted_url.
-    return clean_url_formatting(converted_url) if converted_url else original_url
+    if converted_url and "linksredirect.com" in converted_url:
+        return wrap_fast_redirect_url(converted_url, user_sub_id)
+
+    raw_url = target_url or original_url
+    cuelinks_url = to_cuelinks(raw_url, user_sub_id)
+    return wrap_fast_redirect_url(cuelinks_url, user_sub_id)
 
 
 def get_deal_link_prefix(store: str = "", is_amz: bool = False) -> str:
@@ -1460,28 +1472,6 @@ async def build_inbody_deal_caption(
         caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
         return caption
 
-    # Pre-fetch short URLs from api_shorten_link for non-Amazon, non-branded deals in parallel
-    short_url_map: dict[str, str] = {}
-    need_shortening = [
-        d for d in converted_deals
-        if not d.get("is_amz")
-        and not is_branded_shortlink(d.get("original_url", ""))
-        and d.get("converted_url", "")
-        and user_id
-    ]
-    if need_shortening:
-        try:
-            tasks = [
-                api_shorten_link(d["converted_url"], user_id=user_id, sub_id=user_sub_id)
-                for d in need_shortening
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for d, res in zip(need_shortening, results):
-                if isinstance(res, str) and res:
-                    short_url_map[d["original_url"]] = res
-        except Exception as short_err:
-            log.debug("Batch short URL resolution error: %s", short_err)
-
     replaced_deals = set()
 
     for d in converted_deals:
@@ -1490,27 +1480,28 @@ async def build_inbody_deal_caption(
         target_url = d.get("target_url", "")
         store = d.get("store", "Store")
         is_amz = bool(d.get("is_amz"))
+        effective_sub = user_sub_id or resolve_compact_sub_id(user_id=user_id)
 
-        # Build the native trackable plain-text URL (no kamaikaro wrapper)
-        # For non-Amazon: prefer api-shortened link over raw linksredirect URL
+        # Build the trackable deal URL
         if is_amz:
-            native_url = get_native_deal_link(
+            deal_url = get_native_deal_link(
                 store=store, is_amz=is_amz, original_url=orig, converted_url=conv,
-                target_url=target_url, user_sub_id=user_sub_id, custom_amazon_tag=custom_amazon_tag,
+                target_url=target_url, user_sub_id=effective_sub, custom_amazon_tag=custom_amazon_tag,
             )
         else:
-            # Prefer: original branded shortlink → api short URL → converted_url
-            if is_branded_shortlink(orig):
-                native_url = orig.strip()
-            elif orig in short_url_map:
-                native_url = short_url_map[orig]
+            # Non-Amazon affiliate conversion pipeline:
+            # Cuelinks wrapper -> Kamaikaro real-time click tracking router
+            if conv and "kamaikaro.in/api/r" in conv:
+                deal_url = conv
+            elif conv and "linksredirect.com" in conv:
+                deal_url = wrap_fast_redirect_url(conv, effective_sub)
             else:
-                # Last resort: use original branded source link or converted_url
-                # but never expose raw linksredirect URL as visible text
-                native_url = orig if is_branded_shortlink(orig) else conv
+                raw_or_expanded = target_url or orig
+                cuelinks_url = to_cuelinks(raw_or_expanded, effective_sub)
+                deal_url = wrap_fast_redirect_url(cuelinks_url, effective_sub)
 
         pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
-        deal_line = f"{pfx}{native_url}"
+        deal_line = f"{pfx}{deal_url}"
 
         md_pattern = re.compile(r'\[([^\]]+)\]\(' + re.escape(orig) + r'\)')
 
@@ -1523,14 +1514,14 @@ async def build_inbody_deal_caption(
                 if is_link_line_only(line, orig, md_match.group(0)):
                     new_lines.append(deal_line)
                 else:
-                    new_lines.append(md_pattern.sub(native_url, line))
+                    new_lines.append(md_pattern.sub(deal_url, line))
                 deal_matched = True
                 replaced_deals.add(orig)
             elif orig and orig in line:
                 if is_link_line_only(line, orig):
                     new_lines.append(deal_line)
                 else:
-                    new_lines.append(line.replace(orig, native_url))
+                    new_lines.append(line.replace(orig, deal_url))
                 deal_matched = True
                 replaced_deals.add(orig)
             else:
@@ -1549,20 +1540,23 @@ async def build_inbody_deal_caption(
             conv = d.get("converted_url", "")
             target_url = d.get("target_url", "")
             orig = d.get("original_url", "")
+            effective_sub = user_sub_id or resolve_compact_sub_id(user_id=user_id)
             if is_amz:
-                native_url = get_native_deal_link(
+                deal_url = get_native_deal_link(
                     store=store, is_amz=is_amz, original_url=orig, converted_url=conv,
-                    target_url=target_url, user_sub_id=user_sub_id, custom_amazon_tag=custom_amazon_tag,
+                    target_url=target_url, user_sub_id=effective_sub, custom_amazon_tag=custom_amazon_tag,
                 )
             else:
-                if is_branded_shortlink(orig):
-                    native_url = orig.strip()
-                elif orig in short_url_map:
-                    native_url = short_url_map[orig]
+                if conv and "kamaikaro.in/api/r" in conv:
+                    deal_url = conv
+                elif conv and "linksredirect.com" in conv:
+                    deal_url = wrap_fast_redirect_url(conv, effective_sub)
                 else:
-                    native_url = orig if is_branded_shortlink(orig) else conv
+                    raw_or_expanded = target_url or orig
+                    cuelinks_url = to_cuelinks(raw_or_expanded, effective_sub)
+                    deal_url = wrap_fast_redirect_url(cuelinks_url, effective_sub)
             pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
-            add_lines.append(f"{pfx}{native_url}")
+            add_lines.append(f"{pfx}{deal_url}")
         if caption:
             caption = f"{caption}\n\n" + "\n".join(add_lines)
         else:
@@ -1571,7 +1565,7 @@ async def build_inbody_deal_caption(
     # Safety pass: strip any bare linksredirect.com URLs that slipped through
     # (these are raw Cuelinks redirect URLs — never expose to users as plain text)
     caption = re.sub(
-        r'(?<!href=")(?<!href=\')https://linksredirect\.com/[^\s<>"\')\]]+',
+        r'(?<!url=)(?<!url%3D)(?<!href=")(?<!href=\')https://linksredirect\.com/[^\s<>"\')\]]+',
         "",
         caption,
     )
@@ -1579,7 +1573,7 @@ async def build_inbody_deal_caption(
     caption = re.sub(r'\[Deal Link\]\s*(?!\(https?://)', '', caption)
 
     # Ensure deal line has clean paragraph separation below title/price lines
-    caption = re.sub(r"([^\n])\n((?:🔗 |- )https://)", r"\1\n\n\2", caption)
+    caption = re.sub(r"([^\n])\n((?:🔗 |- )https?://)", r"\1\n\n\2", caption)
     caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
     return caption
 
@@ -1844,7 +1838,10 @@ async def resolve_and_convert_deals(
                 )
                 store = "Amazon"
             else:
-                converted_url = clean_url_formatting(to_cuelinks(clean_url, effective_sub_id))
+                raw_or_expanded_url = clean_url or target_url or u
+                cuelinks_url = to_cuelinks(raw_or_expanded_url, effective_sub_id)
+                final_tracking_url = wrap_fast_redirect_url(cuelinks_url, effective_sub_id)
+                converted_url = clean_url_formatting(final_tracking_url)
                 clean_lower = f"{clean_url} {target_url} {u}".lower()
                 if "shopsy" in clean_lower:
                     store = "Shopsy"
@@ -1985,7 +1982,8 @@ async def convert_text(
                     )
                 )
             else:
-                converted_url = clean_url_formatting(to_cuelinks(clean_url, effective_sub_id))
+                cuelinks_url = to_cuelinks(clean_url, effective_sub_id)
+                converted_url = clean_url_formatting(wrap_fast_redirect_url(cuelinks_url, effective_sub_id))
 
             # Mandatory short URL conversion via API route:
             # POST https://www.kamaikaro.in/api/links/shorten
