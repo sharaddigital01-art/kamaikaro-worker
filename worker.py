@@ -1166,30 +1166,34 @@ def to_amazon_affiliate_url(
     )
 
 
+_SHORTEN_CACHE: dict[str, str] = {}
+
+
 async def api_shorten_link(
     original_url: str,
     user_id: Optional[str] = None,
     sub_id: Optional[str] = None,
 ) -> Optional[str]:
     """Call web shortener API: POST https://www.kamaikaro.in/api/links/shorten
-    Request body: { "originalUrl": convertedUrl, "userId": user_id, "subId": sub_id }
-    Uses 5.5-second timeout.
-    Returns clean short link: https://kamaikaro.in/l/{shortCode} or None on failure/non-200.
+    Request body: { "originalUrl": cuelinksUrl, "userId": user_id, "subId": sub_id }
+    Uses 4.5-second timeout and in-memory cache.
+    Returns clean short link (e.g. https://kamaikaro.in/{slug}) or None on failure/non-200.
     """
     clean_orig = clean_url_formatting(original_url)
     if not clean_orig:
         return None
 
-    # Candidate endpoints: primary branded domain first, fallback to BASE_WEB_URL
+    compact_sub_id = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
+    cache_key = f"{clean_orig}_{compact_sub_id}"
+    if cache_key in _SHORTEN_CACHE:
+        return _SHORTEN_CACHE[cache_key]
+
     endpoints = [
         "https://www.kamaikaro.in/api/links/shorten",
+        f"{BASE_WEB_URL}/api/links/shorten",
         "https://kamaikaro.in/api/links/shorten",
     ]
-    base_endpoint = f"{BASE_WEB_URL}/api/links/shorten"
-    if base_endpoint not in endpoints:
-        endpoints.append(base_endpoint)
 
-    compact_sub_id = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
     payload: dict[str, Any] = {"originalUrl": clean_orig}
     if user_id:
         payload["userId"] = str(user_id)
@@ -1198,15 +1202,40 @@ async def api_shorten_link(
 
     async def _request_shorten() -> Optional[str]:
         s = await http()
-        timeout = aiohttp.ClientTimeout(total=5.0, connect=2.0, sock_read=3.0)
+        timeout = aiohttp.ClientTimeout(total=5.0, connect=2.0, sock_read=4.5)
 
         for endpoint in endpoints:
             try:
-                async with s.post(endpoint, json=payload, timeout=timeout) as resp:
+                async with s.post(endpoint, json=payload, timeout=timeout, allow_redirects=True) as resp:
                     if resp.status in (200, 201):
                         data = await resp.json(content_type=None)
                         if isinstance(data, dict):
-                            # 1. Direct shortCode / code field
+                            # 1. Direct shortUrl / shortenedUrl field
+                            short_url = (
+                                data.get("shortUrl")
+                                or data.get("shortenedUrl")
+                                or (data.get("link") or {}).get("shortUrl")
+                                or (data.get("data") or {}).get("shortUrl")
+                            )
+                            if short_url and isinstance(short_url, str):
+                                clean_short = clean_url_formatting(short_url)
+                                if clean_short.startswith("http"):
+                                    _SHORTEN_CACHE[cache_key] = clean_short
+                                    return clean_short
+
+                            # 2. Slug field
+                            slug = (
+                                data.get("slug")
+                                or (data.get("link") or {}).get("slug")
+                                or (data.get("data") or {}).get("slug")
+                            )
+                            if slug and isinstance(slug, str):
+                                clean_slug = slug.strip().lstrip("/")
+                                res_url = clean_url_formatting(f"https://kamaikaro.in/{clean_slug}")
+                                _SHORTEN_CACHE[cache_key] = res_url
+                                return res_url
+
+                            # 3. Direct shortCode / code field
                             code = (
                                 data.get("shortCode")
                                 or data.get("code")
@@ -1217,41 +1246,9 @@ async def api_shorten_link(
                             )
                             if code and isinstance(code, str):
                                 clean_code = code.strip().lstrip("/")
-                                return clean_url_formatting(f"https://kamaikaro.in/l/{clean_code}")
-
-                            # 2. Direct shortUrl / shortenedUrl / url field
-                            short_url = (
-                                data.get("shortUrl")
-                                or data.get("shortenedUrl")
-                                or data.get("url")
-                                or (data.get("link") or {}).get("shortUrl")
-                                or (data.get("link") or {}).get("url")
-                                or (data.get("data") or {}).get("shortUrl")
-                                or (data.get("data") or {}).get("url")
-                            )
-                            if short_url and isinstance(short_url, str):
-                                clean_short = clean_url_formatting(short_url)
-                                m = re.match(r"^https?://(?:www\.)?kamaikaro\.in/(?:l/)?([a-zA-Z0-9_\-]+)$", clean_short)
-                                if m:
-                                    return f"https://kamaikaro.in/l/{m.group(1)}"
-                                if clean_short.startswith("http"):
-                                    return clean_short
-                                elif clean_short.startswith("/l/"):
-                                    return clean_url_formatting(f"https://kamaikaro.in{clean_short}")
-                                elif clean_short.startswith("/"):
-                                    return clean_url_formatting(f"https://kamaikaro.in/l{clean_short}")
-                                else:
-                                    return clean_url_formatting(f"https://kamaikaro.in/l/{clean_short}")
-
-                            # 3. Slug field
-                            slug = (
-                                data.get("slug")
-                                or (data.get("link") or {}).get("slug")
-                                or (data.get("data") or {}).get("slug")
-                            )
-                            if slug and isinstance(slug, str):
-                                clean_slug = slug.strip().lstrip("/")
-                                return clean_url_formatting(f"https://kamaikaro.in/l/{clean_slug}")
+                                res_url = clean_url_formatting(f"https://kamaikaro.in/{clean_code}")
+                                _SHORTEN_CACHE[cache_key] = res_url
+                                return res_url
                     else:
                         resp_text = await resp.text()
                         log.warning("api_shorten_link (%s) HTTP %d: %s", endpoint, resp.status, resp_text[:120])
@@ -1261,11 +1258,14 @@ async def api_shorten_link(
         return None
 
     try:
-        return await asyncio.wait_for(_request_shorten(), timeout=5.5)
+        res = await asyncio.wait_for(_request_shorten(), timeout=5.5)
+        if res:
+            _SHORTEN_CACHE[cache_key] = res
+        return res
     except asyncio.TimeoutError:
-        log.warning("api_shorten_link timed out (>5.5s) for %s; applying markdown hyperlink fallback", clean_orig[:60])
+        log.warning("api_shorten_link timed out (>5.0s) for %s; applying fallback hyperlink", clean_orig[:60])
     except Exception as e:
-        log.warning("api_shorten_link failed for %s (%s); applying markdown hyperlink fallback", clean_orig[:60], e)
+        log.warning("api_shorten_link failed for %s (%s); applying fallback hyperlink", clean_orig[:60], e)
 
     return None
 
@@ -1418,42 +1418,61 @@ async def build_inbody_deal_caption(
     custom_amazon_tag: str = "",
 ) -> str:
     """Format deal post with native store-branded plain-text shortlinks (Zero Warning Popup, Zero Buttons):
-    - Amazon: 🔗 https://amzn.to/{ASIN}?tag=kamaikaro02-21&ascsubtag={subid}
-    - Flipkart: - https://fkrt.co/{slug}
-    - Myntra: - https://myntr.in/{slug}
-    - Others: 🔗 {short_url}
-    - Visible URL = actual destination (no kamaikaro.in wrapper, no anti-phishing popup)
-    - Places deal link directly beneath the product title/discount line
-    - Strips external channel join promotions and spam
-    - Strictly prevents raw linksredirect.com from showing as bare text
+    - Amazon: 🔗 https://amzn.to/{ASIN}?tag=kamaikaro02-21&ascsubtag={subid} (100% UNTOUCHED)
+    - Non-Amazon: Compact Kamaikaro shortlink (e.g. https://kamaikaro.in/{slug})
+    - Non-Amazon Fallback: Clean HTML hyperlink (<a href="{final_tracking_url}">Click to Buy</a>)
+    - Preserves category / product labels (e.g. 'Tshirts : https://...' or 'Tshirts : <a href=...>')
+    - Strips external channel promotions and spam
+    - Strictly prevents raw linksredirect.com or nested %252F URLs from showing as plain text
     """
     if not text:
         text = ""
 
     # ------------------------------------------------------------------ #
-    # Pre-process: extract href URLs from HTML anchors and markdown links  #
-    # so the deal loop can locate and monetize them normally.              #
-    #                                                                      #
-    # <a href="URL">any inner text</a>  →  URL                            #
-    # [any inner text](URL)             →  URL                            #
-    #                                                                      #
-    # This prevents anchor stripping from wiping URLs (e.g. Ajio/Myntra   #
-    # channels that send HTML-formatted posts with [Deal Link] anchors).  #
+    # Pre-process: extract href URLs from HTML anchors and markdown links #
+    # Preserving inner category/product text when present (e.g. Tshirts). #
     # ------------------------------------------------------------------ #
-    # HTML anchor: <a href="...">...</a>  (single/double quotes, optional spaces)
+    def _clean_anchor_match(m: re.Match) -> str:
+        url = m.group(1).strip()
+        inner = re.sub(r'<[^>]+>', '', m.group(2) or '').strip()
+        generic_words = {
+            "deal link", "deal", "buy now", "click here", "link", "here",
+            "open link", "get it", "shop now", "view deal", "loot deal",
+            "deal info", "click to buy", "buy", "order now"
+        }
+        clean_inner = re.sub(r'^[👉🛒🛍️🔗⚡🔥📌\s\[\]\(\)\:\-\.]+', '', inner).strip()
+        clean_inner = re.sub(r'[👉🛒🛍️🔗⚡🔥📌\s\[\]\(\)\:\-\.]+$', '', clean_inner).strip()
+        if clean_inner and clean_inner.lower() not in generic_words and len(clean_inner) > 1:
+            return f"{clean_inner} : {url}"
+        return url
+
     text = re.sub(
-        r'<a\s+href=["\']([^"\'>\s]+)["\'][^>]*>.*?</a>',
-        lambda m: m.group(1),
+        r'<a\s+href=["\']([^"\'>\s]+)["\'][^>]*>(.*?)</a>',
+        _clean_anchor_match,
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    # Markdown hyperlink: [inner text](URL) — keep only the URL
+
+    def _clean_md_match(m: re.Match) -> str:
+        inner = m.group(1).strip()
+        url = m.group(2).strip()
+        generic_words = {
+            "deal link", "deal", "buy now", "click here", "link", "here",
+            "open link", "get it", "shop now", "view deal", "loot deal",
+            "deal info", "click to buy", "buy", "order now"
+        }
+        clean_inner = re.sub(r'^[👉🛒🛍️🔗⚡🔥📌\s\[\]\(\)\:\-\.]+', '', inner).strip()
+        clean_inner = re.sub(r'[👉🛒🛍️🔗⚡🔥📌\s\[\]\(\)\:\-\.]+$', '', clean_inner).strip()
+        if clean_inner and clean_inner.lower() not in generic_words and len(clean_inner) > 1:
+            return f"{clean_inner} : {url}"
+        return url
+
     text = re.sub(
         r'\[([^\]]*)\]\((https?://[^\s)]+)\)',
-        lambda m: m.group(2),
+        _clean_md_match,
         text,
     )
-    # Strip any remaining stray HTML tags (bold, italic, etc.) — NOT anchors (already handled above)
+    # Strip any remaining stray formatting tags (bold, italic, etc.)
     text = re.sub(r'</?(?:b|i|u|s|em|strong|br|p|span|div)[^>]*>', '', text, flags=re.IGNORECASE)
 
     promo_patterns = [
@@ -1472,6 +1491,36 @@ async def build_inbody_deal_caption(
         caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
         return caption
 
+    effective_sub = user_sub_id or resolve_compact_sub_id(user_id=user_id)
+
+    # ------------------------------------------------------------------ #
+    # Pre-shorten non-Amazon deals in parallel via shortener API          #
+    # ------------------------------------------------------------------ #
+    short_url_map: dict[str, str] = {}
+    fallback_map: dict[str, str] = {}
+
+    non_amz_deals = [d for d in converted_deals if not d.get("is_amz")]
+    if non_amz_deals:
+        tasks = []
+        for d in non_amz_deals:
+            orig = d.get("original_url", "")
+            target_url = d.get("target_url", "")
+            raw_url = target_url or orig
+            cuelinks_url = d.get("cuelinks_url") or to_cuelinks(raw_url, effective_sub)
+            final_tracking = d.get("final_tracking_url") or wrap_fast_redirect_url(cuelinks_url, effective_sub)
+            fallback_map[orig] = final_tracking
+            # Request a short slug for the long cuelinks_url with subid
+            tasks.append(api_shorten_link(cuelinks_url, user_id=user_id, sub_id=effective_sub))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for d, res in zip(non_amz_deals, results):
+            orig = d.get("original_url", "")
+            if isinstance(res, str) and res.strip():
+                short_url_map[orig] = res.strip()
+                log.info("Shortened non-Amazon deal %s -> %s", orig[:40], res.strip())
+            else:
+                log.info("api_shorten_link returned %s for %s; using HTML hyperlink fallback", res, orig[:40])
+
     replaced_deals = set()
 
     for d in converted_deals:
@@ -1480,7 +1529,6 @@ async def build_inbody_deal_caption(
         target_url = d.get("target_url", "")
         store = d.get("store", "Store")
         is_amz = bool(d.get("is_amz"))
-        effective_sub = user_sub_id or resolve_compact_sub_id(user_id=user_id)
 
         # Build the trackable deal URL
         if is_amz:
@@ -1489,16 +1537,16 @@ async def build_inbody_deal_caption(
                 target_url=target_url, user_sub_id=effective_sub, custom_amazon_tag=custom_amazon_tag,
             )
         else:
-            # Non-Amazon affiliate conversion pipeline:
-            # Cuelinks wrapper -> Kamaikaro real-time click tracking router
-            if conv and "kamaikaro.in/api/r" in conv:
-                deal_url = conv
-            elif conv and "linksredirect.com" in conv:
-                deal_url = wrap_fast_redirect_url(conv, effective_sub)
+            # Non-Amazon affiliate conversion:
+            # 1. Prefer compact shortened URL: https://kamaikaro.in/{slug}
+            if orig in short_url_map:
+                deal_url = short_url_map[orig]
             else:
-                raw_or_expanded = target_url or orig
-                cuelinks_url = to_cuelinks(raw_or_expanded, effective_sub)
-                deal_url = wrap_fast_redirect_url(cuelinks_url, effective_sub)
+                # 2. Fallback: clean HTML hyperlink hiding long tracking parameters
+                final_url = fallback_map.get(orig) or wrap_fast_redirect_url(
+                    to_cuelinks(target_url or orig, effective_sub), effective_sub
+                )
+                deal_url = f'<a href="{final_url}">Click to Buy</a>'
 
         pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
         deal_line = f"{pfx}{deal_url}"
@@ -1540,21 +1588,19 @@ async def build_inbody_deal_caption(
             conv = d.get("converted_url", "")
             target_url = d.get("target_url", "")
             orig = d.get("original_url", "")
-            effective_sub = user_sub_id or resolve_compact_sub_id(user_id=user_id)
             if is_amz:
                 deal_url = get_native_deal_link(
                     store=store, is_amz=is_amz, original_url=orig, converted_url=conv,
                     target_url=target_url, user_sub_id=effective_sub, custom_amazon_tag=custom_amazon_tag,
                 )
             else:
-                if conv and "kamaikaro.in/api/r" in conv:
-                    deal_url = conv
-                elif conv and "linksredirect.com" in conv:
-                    deal_url = wrap_fast_redirect_url(conv, effective_sub)
+                if orig in short_url_map:
+                    deal_url = short_url_map[orig]
                 else:
-                    raw_or_expanded = target_url or orig
-                    cuelinks_url = to_cuelinks(raw_or_expanded, effective_sub)
-                    deal_url = wrap_fast_redirect_url(cuelinks_url, effective_sub)
+                    final_url = fallback_map.get(orig) or wrap_fast_redirect_url(
+                        to_cuelinks(target_url or orig, effective_sub), effective_sub
+                    )
+                    deal_url = f'<a href="{final_url}">Click to Buy</a>'
             pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
             add_lines.append(f"{pfx}{deal_url}")
         if caption:
@@ -1569,11 +1615,19 @@ async def build_inbody_deal_caption(
         "",
         caption,
     )
+    # Also safety check: never expose raw kamaikaro.in/api/r?url= as bare plain text
+    # (only allowed inside href="...")
+    caption = re.sub(
+        r'(?<!href=")(?<!href=\')https://(?:www\.)?kamaikaro\.in/api/r\?url=[^\s<>"\')\]]+',
+        "",
+        caption,
+    )
     # Also remove any orphaned "[Deal Link]" placeholder text with no URL following it
     caption = re.sub(r'\[Deal Link\]\s*(?!\(https?://)', '', caption)
 
     # Ensure deal line has clean paragraph separation below title/price lines
     caption = re.sub(r"([^\n])\n((?:🔗 |- )https?://)", r"\1\n\n\2", caption)
+    caption = re.sub(r"([^\n])\n((?:🔗 |- )<a href=)", r"\1\n\n\2", caption)
     caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
     return caption
 
@@ -1860,6 +1914,8 @@ async def resolve_and_convert_deals(
                 "original_url": u,
                 "target_url": target_url,
                 "converted_url": converted_url,
+                "cuelinks_url": cuelinks_url if not is_amz else "",
+                "final_tracking_url": final_tracking_url if not is_amz else "",
                 "is_amz": is_amz,
                 "store": store,
                 "btn_label": btn_label,
@@ -1987,10 +2043,11 @@ async def convert_text(
 
             # Mandatory short URL conversion via API route:
             # POST https://www.kamaikaro.in/api/links/shorten
-            # with { originalUrl: convertedUrl, userId: user_id, subId: sub_id }
+            # with { originalUrl: cuelinksUrl, userId: user_id, subId: sub_id }
             short_url = None
             try:
-                short_url = await api_shorten_link(converted_url, user_id=user_id, sub_id=effective_sub_id)
+                target_shorten_url = cuelinks_url if not is_amz else converted_url
+                short_url = await api_shorten_link(target_shorten_url, user_id=user_id, sub_id=effective_sub_id)
             except Exception as short_err:
                 log.warning("api_shorten_link error in convert_text: %s", short_err)
 
@@ -1998,10 +2055,10 @@ async def convert_text(
                 final_link = clean_url_formatting(short_url)
                 log.info("Shortened affiliate URL: %s -> %s", u, final_link)
             else:
-                # Fallback: If shorten API fails, format the text cleanly with Markdown hyperlink:
-                # [Buy Now / View Deal](<convertedUrl>) so long parameters remain hidden behind clean text.
-                final_link = f"[Buy Now / View Deal](<{converted_url}>)"
-                log.info("api_shorten_link failed; formatted as clean markdown hyperlink: %s -> %s", u, final_link)
+                # Fallback: If shorten API fails, format the text cleanly with HTML hyperlink:
+                # <a href="{converted_url}">Click to Buy</a> so long parameters remain hidden behind clean text.
+                final_link = f'<a href="{converted_url}">Click to Buy</a>'
+                log.info("api_shorten_link failed; formatted as clean hyperlink: %s -> %s", u, final_link)
 
             text = text.replace(u, final_link)
             converted_count += 1
@@ -2513,40 +2570,53 @@ async def bot_send_with_retry(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     max_retries: int = 2,
 ) -> bool:
-    """Send post to target channel via Aiogram Bot with retry logic and plain-text caption."""
+    """Send post to target channel via Aiogram Bot with retry logic and HTML/plain parse_mode support."""
+    bot_parse_mode = "HTML" if "<a href=" in (caption or "") else None
     for attempt in range(max_retries + 1):
         try:
             if is_real_media and media_path and os.path.exists(media_path):
                 file_input = FSInputFile(media_path)
                 if len(caption) <= CAPTION_LIMIT:
                     try:
-                        await bot.send_photo(target, file_input, caption=caption, parse_mode=None, reply_markup=reply_markup)
+                        await bot.send_photo(target, file_input, caption=caption, parse_mode=bot_parse_mode, reply_markup=reply_markup)
                         return True
                     except Exception as photo_err:
                         try:
-                            await bot.send_document(target, file_input, caption=caption, parse_mode=None, reply_markup=reply_markup)
+                            await bot.send_document(target, file_input, caption=caption, parse_mode=bot_parse_mode, reply_markup=reply_markup)
                             return True
                         except Exception:
                             log.warning("Bot media upload failed (%s); falling back to text message", photo_err)
                 else:
                     try:
                         sent = await bot.send_photo(target, file_input)
-                        await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=None, reply_to_message_id=sent.message_id, reply_markup=reply_markup)
+                        await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=bot_parse_mode, reply_to_message_id=sent.message_id, reply_markup=reply_markup)
                         return True
                     except Exception:
                         try:
                             sent = await bot.send_document(target, file_input)
-                            await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=None, reply_to_message_id=sent.message_id, reply_markup=reply_markup)
+                            await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=bot_parse_mode, reply_to_message_id=sent.message_id, reply_markup=reply_markup)
                             return True
                         except Exception:
                             log.warning("Bot media chunked send failed; falling back to text message")
 
             # Text-only send (or media fallback)
-            await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=None, reply_markup=reply_markup)
+            await bot.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=bot_parse_mode, reply_markup=reply_markup)
             return True
 
         except Exception as e:
             err_str = str(e)
+            if bot_parse_mode and "parse" in err_str.lower():
+                log.warning("Bot Token hit entity parse error; stripping HTML tags and retrying plain text: %s", e)
+                plain_cap = re.sub(r'<[^>]+>', '', caption)
+                try:
+                    if is_real_media and media_path and os.path.exists(media_path):
+                        file_input = FSInputFile(media_path)
+                        await bot.send_photo(target, file_input, caption=plain_cap[:CAPTION_LIMIT], parse_mode=None, reply_markup=reply_markup)
+                    else:
+                        await bot.send_message(target, plain_cap[:MESSAGE_LIMIT], parse_mode=None, reply_markup=reply_markup)
+                    return True
+                except Exception:
+                    pass
             retry_after = getattr(e, "retry_after", None)
             if retry_after is not None and retry_after <= 15 and attempt < max_retries:
                 log.warning("Bot hit TelegramRetryAfter (%ss); sleeping and retrying for %s...", retry_after, target)
@@ -2571,21 +2641,22 @@ async def telethon_send_with_retry(
     buttons: Any = None,
     max_retries: int = 2,
 ) -> bool:
-    """Send post via Telethon client with retry logic and plain-text caption support."""
+    """Send post via Telethon client with retry logic and HTML/plain parse_mode support."""
+    tele_parse_mode = "html" if "<a href=" in (caption or "") else None
     for attempt in range(max_retries + 1):
         try:
             file_to_send = media if media else (media_path if media_path and os.path.exists(media_path) else None)
             if is_real_media and file_to_send:
                 if len(caption) <= CAPTION_LIMIT:
-                    await u_client.send_file(target, file=file_to_send, caption=caption, buttons=buttons)
+                    await u_client.send_file(target, file=file_to_send, caption=caption, parse_mode=tele_parse_mode, buttons=buttons)
                     return True
                 else:
                     sent_media = await u_client.send_file(target, file=file_to_send)
                     reply_id = getattr(sent_media, "id", None)
-                    await u_client.send_message(target, caption[:MESSAGE_LIMIT], reply_to=reply_id, buttons=buttons)
+                    await u_client.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=tele_parse_mode, reply_to=reply_id, buttons=buttons)
                     return True
             else:
-                await u_client.send_message(target, caption[:MESSAGE_LIMIT], buttons=buttons)
+                await u_client.send_message(target, caption[:MESSAGE_LIMIT], parse_mode=tele_parse_mode, buttons=buttons)
                 return True
 
         except FloodWaitError as fw:
@@ -2596,6 +2667,16 @@ async def telethon_send_with_retry(
             log.error("Telethon FloodWait (%ds) exceeded limit on target %s", fw.seconds, target)
             return False
         except Exception as e:
+            if tele_parse_mode and "parse" in str(e).lower():
+                plain_cap = re.sub(r'<[^>]+>', '', caption)
+                try:
+                    if is_real_media and file_to_send:
+                        await u_client.send_file(target, file=file_to_send, caption=plain_cap[:CAPTION_LIMIT], parse_mode=None, buttons=buttons)
+                    else:
+                        await u_client.send_message(target, plain_cap[:MESSAGE_LIMIT], parse_mode=None, buttons=buttons)
+                    return True
+                except Exception:
+                    pass
             if attempt < max_retries:
                 await asyncio.sleep(1.0)
                 continue
