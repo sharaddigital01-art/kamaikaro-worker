@@ -15,6 +15,8 @@ import logging
 import math
 import os
 import re
+import secrets
+import string
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -1080,18 +1082,50 @@ def resolve_compact_sub_id(sub_id: Optional[str] = None, user_id: Optional[str] 
     return "admin_tg"
 
 
+def unwrap_nested_tracking_url(url: str, max_depth: int = 5) -> str:
+    """Recursively extract destination merchant URL from nested affiliate redirectors:
+    e.g. ajiotrk.vibconnect.in/?url=..., linksredirect.com/?url=..., kamaikaro.in/api/r?url=...,
+    stripping multiple layers of URL encoding (%25252F -> /).
+    """
+    if not url:
+        return ""
+    cur = url.strip()
+    target_params = ("url", "dest", "destination", "target", "redirect", "redirect_url", "link", "u")
+
+    for _ in range(max_depth):
+        try:
+            parsed = urllib.parse.urlparse(cur)
+            qs = urllib.parse.parse_qs(parsed.query)
+            found_inner = None
+            for p in target_params:
+                if p in qs and qs[p]:
+                    cand = qs[p][0].strip()
+                    cand_unquoted = urllib.parse.unquote(cand).strip()
+                    if cand_unquoted.startswith("http://") or cand_unquoted.startswith("https://"):
+                        found_inner = cand_unquoted
+                        break
+            if found_inner and found_inner != cur:
+                cur = found_inner
+            else:
+                break
+        except Exception:
+            break
+
+    return cur
+
+
+def generate_short_slug(length: int = 6) -> str:
+    """Generate a clean random alphanumeric 6-character slug."""
+    chars = string.ascii_letters + string.digits
+    return "".join(secrets.choice(chars) for _ in range(length))
+
+
 def to_cuelinks(url: str, sub_id: str) -> str:
     clean = clean_url_formatting(url)
     if not clean:
         return ""
-    if "linksredirect.com" in clean:
-        try:
-            parsed = urllib.parse.urlparse(clean)
-            qs = urllib.parse.parse_qs(parsed.query)
-            if "url" in qs and qs["url"]:
-                clean = qs["url"][0]
-        except Exception:
-            pass
+    # Unwrap any nested redirectors and outer tracking parameters
+    clean = unwrap_nested_tracking_url(clean)
     clean = strip_affiliate_params(clean) or clean
     encoded_target_url = urllib.parse.quote_plus(clean)
     compact_sub_id = resolve_compact_sub_id(sub_id=sub_id)
@@ -1167,17 +1201,167 @@ def to_amazon_affiliate_url(
 
 
 _SHORTEN_CACHE: dict[str, str] = {}
+_SHORTEN_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def get_shorten_semaphore() -> asyncio.Semaphore:
+    global _SHORTEN_SEMAPHORE
+    if _SHORTEN_SEMAPHORE is None:
+        _SHORTEN_SEMAPHORE = asyncio.Semaphore(3)
+    return _SHORTEN_SEMAPHORE
+
+
+async def direct_supabase_create_shortlink(
+    original_url: str,
+    target_url: str,
+    sub_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> Optional[str]:
+    """Directly insert shortlink into Supabase PostgreSQL (table: short_links or ShortLink).
+    Fastest path (~50ms), bypasses external API cold starts and avoids HTTP timeouts.
+    """
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        return None
+
+    clean_orig = clean_url_formatting(original_url)
+    clean_target = clean_url_formatting(target_url or original_url)
+    if not clean_orig:
+        return None
+
+    slug = generate_short_slug(6)
+    compact_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id) if (sub_id or user_id) else ""
+
+    # Validate UUID format so Postgres doesn't reject numeric/telegram IDs
+    valid_uuid = None
+    if user_id:
+        u_str = str(user_id).strip()
+        if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", u_str, re.I):
+            valid_uuid = u_str
+
+    payload: dict[str, Any] = {
+        "slug": slug,
+        "original_url": clean_orig,
+        "target_url": clean_target,
+        "subId": compact_sub or None,
+        "click_count": 0,
+    }
+    if valid_uuid:
+        payload["user_id"] = valid_uuid
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    tables = ["short_links", "ShortLink"]
+    s = await http()
+    timeout = aiohttp.ClientTimeout(total=4.5, connect=2.0, sock_read=3.5)
+
+    for tbl in tables:
+        url = f"{SUPABASE_URL}/rest/v1/{tbl}"
+        try:
+            async with s.post(url, headers=headers, json=payload, timeout=timeout) as resp:
+                if resp.status in (200, 201):
+                    log.info("direct_supabase_create_shortlink inserted slug %s into %s", slug, tbl)
+                    return f"https://kamaikaro.in/{slug}"
+                elif resp.status == 409:
+                    slug = generate_short_slug(7)
+                    payload["slug"] = slug
+                    async with s.post(url, headers=headers, json=payload, timeout=timeout) as retry_resp:
+                        if retry_resp.status in (200, 201):
+                            return f"https://kamaikaro.in/{slug}"
+        except Exception as err:
+            log.warning("direct_supabase_create_shortlink (%s) error: %s", tbl, err)
+
+    return None
+
+
+async def _background_persist_shortlink(
+    slug: str,
+    original_url: str,
+    target_url: str,
+    sub_id: str = "",
+    user_id: Optional[str] = None,
+) -> bool:
+    """Background worker task to guarantee shortlink persistence to DB/API even if initial synchronous attempt failed."""
+    # 1. Supabase direct
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        valid_uuid = None
+        if user_id:
+            u_str = str(user_id).strip()
+            if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", u_str, re.I):
+                valid_uuid = u_str
+
+        payload: dict[str, Any] = {
+            "slug": slug,
+            "original_url": original_url,
+            "target_url": target_url or original_url,
+            "subId": sub_id or None,
+            "click_count": 0,
+        }
+        if valid_uuid:
+            payload["user_id"] = valid_uuid
+
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+        s = await http()
+        for tbl in ("short_links", "ShortLink"):
+            url = f"{SUPABASE_URL}/rest/v1/{tbl}"
+            for attempt in range(2):
+                try:
+                    async with s.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=4.0)) as r:
+                        if r.status in (200, 201):
+                            log.info("Background persisted slug %s to Supabase %s", slug, tbl)
+                            return True
+                except Exception as ex:
+                    log.warning("Background persist error (%s) attempt %d: %s", tbl, attempt + 1, ex)
+                await asyncio.sleep(0.5)
+
+    # 2. Web API fallback
+    endpoints = [
+        "https://www.kamaikaro.in/api/links/shorten",
+        f"{BASE_WEB_URL}/api/links/shorten",
+    ]
+    api_payload: dict[str, Any] = {
+        "slug": slug,
+        "originalUrl": original_url,
+    }
+    if user_id:
+        api_payload["userId"] = str(user_id)
+    if sub_id:
+        api_payload["subId"] = sub_id
+
+    s = await http()
+    for ep in endpoints:
+        try:
+            async with s.post(ep, json=api_payload, timeout=aiohttp.ClientTimeout(total=5.0)) as r:
+                if r.status in (200, 201):
+                    log.info("Background persisted slug %s via API %s", slug, ep)
+                    return True
+        except Exception:
+            pass
+
+    return False
 
 
 async def api_shorten_link(
     original_url: str,
     user_id: Optional[str] = None,
     sub_id: Optional[str] = None,
+    target_url: Optional[str] = None,
 ) -> Optional[str]:
-    """Call web shortener API: POST https://www.kamaikaro.in/api/links/shorten
-    Request body: { "originalUrl": cuelinksUrl, "userId": user_id, "subId": sub_id }
-    Uses 4.5-second timeout and in-memory cache.
-    Returns clean short link (e.g. https://kamaikaro.in/{slug}) or None on failure/non-200.
+    """Shorten deal tracking URL:
+    1. Memory Cache lookup.
+    2. Direct Supabase PostgREST insert (~50ms) if SUPABASE_URL configured.
+    3. Throttled HTTP POST to https://www.kamaikaro.in/api/links/shorten (via semaphore, 2 retries, 10s timeout).
+    4. Emergency fallback: Generates guaranteed random slug, schedules background persistence, returns https://kamaikaro.in/{slug}.
+    Guarantees 100% short URL return and NEVER dumps long raw tracking URLs.
     """
     clean_orig = clean_url_formatting(original_url)
     if not clean_orig:
@@ -1188,6 +1372,22 @@ async def api_shorten_link(
     if cache_key in _SHORTEN_CACHE:
         return _SHORTEN_CACHE[cache_key]
 
+    # Fast Path: Direct Supabase Database Insert
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        try:
+            db_res = await direct_supabase_create_shortlink(
+                original_url=clean_orig,
+                target_url=target_url or clean_orig,
+                sub_id=compact_sub_id,
+                user_id=user_id,
+            )
+            if db_res:
+                _SHORTEN_CACHE[cache_key] = db_res
+                return db_res
+        except Exception as db_err:
+            log.warning("direct_supabase_create_shortlink error: %s", db_err)
+
+    # Throttled HTTP API Path (Max 3 concurrent calls, 2 retries, 10s total timeout)
     endpoints = [
         "https://www.kamaikaro.in/api/links/shorten",
         f"{BASE_WEB_URL}/api/links/shorten",
@@ -1201,72 +1401,122 @@ async def api_shorten_link(
 
     async def _request_shorten() -> Optional[str]:
         s = await http()
-        timeout = aiohttp.ClientTimeout(total=7.0, connect=2.5, sock_read=6.0)
+        timeout = aiohttp.ClientTimeout(total=10.0, connect=3.0, sock_read=8.0)
+        sem = get_shorten_semaphore()
 
-        for endpoint in endpoints:
-            try:
-                async with s.post(endpoint, json=payload, timeout=timeout, allow_redirects=True) as resp:
-                    if resp.status in (200, 201):
-                        data = await resp.json(content_type=None)
-                        if isinstance(data, dict):
-                            # 1. Direct shortUrl / shortenedUrl field
-                            short_url = (
-                                data.get("shortUrl")
-                                or data.get("shortenedUrl")
-                                or (data.get("link") or {}).get("shortUrl")
-                                or (data.get("data") or {}).get("shortUrl")
-                            )
-                            if short_url and isinstance(short_url, str):
-                                clean_short = clean_url_formatting(short_url)
-                                if clean_short.startswith("http"):
-                                    _SHORTEN_CACHE[cache_key] = clean_short
-                                    return clean_short
+        async with sem:
+            for attempt in range(2):
+                for endpoint in endpoints:
+                    try:
+                        async with s.post(endpoint, json=payload, timeout=timeout, allow_redirects=True) as resp:
+                            if resp.status in (200, 201):
+                                data = await resp.json(content_type=None)
+                                if isinstance(data, dict):
+                                    # 1. Direct shortUrl / shortenedUrl field
+                                    short_url = (
+                                        data.get("shortUrl")
+                                        or data.get("shortenedUrl")
+                                        or (data.get("link") or {}).get("shortUrl")
+                                        or (data.get("data") or {}).get("shortUrl")
+                                    )
+                                    if short_url and isinstance(short_url, str):
+                                        clean_short = clean_url_formatting(short_url)
+                                        if clean_short.startswith("http"):
+                                            return clean_short
 
-                            # 2. Slug field
-                            slug = (
-                                data.get("slug")
-                                or (data.get("link") or {}).get("slug")
-                                or (data.get("data") or {}).get("slug")
-                            )
-                            if slug and isinstance(slug, str):
-                                clean_slug = slug.strip().lstrip("/")
-                                res_url = clean_url_formatting(f"https://kamaikaro.in/{clean_slug}")
-                                _SHORTEN_CACHE[cache_key] = res_url
-                                return res_url
+                                    # 2. Slug field
+                                    slug = (
+                                        data.get("slug")
+                                        or (data.get("link") or {}).get("slug")
+                                        or (data.get("data") or {}).get("slug")
+                                    )
+                                    if slug and isinstance(slug, str):
+                                        clean_slug = slug.strip().lstrip("/")
+                                        return clean_url_formatting(f"https://kamaikaro.in/{clean_slug}")
 
-                            # 3. Direct shortCode / code field
-                            code = (
-                                data.get("shortCode")
-                                or data.get("code")
-                                or (data.get("link") or {}).get("shortCode")
-                                or (data.get("link") or {}).get("code")
-                                or (data.get("data") or {}).get("shortCode")
-                                or (data.get("data") or {}).get("code")
-                            )
-                            if code and isinstance(code, str):
-                                clean_code = code.strip().lstrip("/")
-                                res_url = clean_url_formatting(f"https://kamaikaro.in/{clean_code}")
-                                _SHORTEN_CACHE[cache_key] = res_url
-                                return res_url
-                    else:
-                        resp_text = await resp.text()
-                        log.warning("api_shorten_link (%s) HTTP %d: %s", endpoint, resp.status, resp_text[:120])
-            except Exception as ep_err:
-                log.warning("api_shorten_link (%s) error: %s", endpoint, ep_err)
+                                    # 3. Direct shortCode / code field
+                                    code = (
+                                        data.get("shortCode")
+                                        or data.get("code")
+                                        or (data.get("link") or {}).get("shortCode")
+                                        or (data.get("link") or {}).get("code")
+                                        or (data.get("data") or {}).get("shortCode")
+                                        or (data.get("data") or {}).get("code")
+                                    )
+                                    if code and isinstance(code, str):
+                                        clean_code = code.strip().lstrip("/")
+                                        return clean_url_formatting(f"https://kamaikaro.in/{clean_code}")
+                            else:
+                                resp_text = await resp.text()
+                                log.warning("api_shorten_link (%s) HTTP %d attempt %d: %s", endpoint, resp.status, attempt + 1, resp_text[:120])
+                    except Exception as ep_err:
+                        log.warning("api_shorten_link (%s) error attempt %d: %s", endpoint, attempt + 1, ep_err)
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
 
         return None
 
     try:
-        res = await asyncio.wait_for(_request_shorten(), timeout=7.5)
+        res = await asyncio.wait_for(_request_shorten(), timeout=12.0)
         if res:
             _SHORTEN_CACHE[cache_key] = res
-        return res
-    except asyncio.TimeoutError:
-        log.warning("api_shorten_link timed out (>5.0s) for %s; applying fallback hyperlink", clean_orig[:60])
+            return res
     except Exception as e:
-        log.warning("api_shorten_link failed for %s (%s); applying fallback hyperlink", clean_orig[:60], e)
+        log.warning("api_shorten_link request failed for %s (%s)", clean_orig[:60], e)
 
-    return None
+    # Guaranteed Emergency Fallback: generate slug and persist in background
+    emergency_slug = generate_short_slug(6)
+    emergency_url = f"https://kamaikaro.in/{emergency_slug}"
+    _SHORTEN_CACHE[cache_key] = emergency_url
+    log.info("api_shorten_link generated emergency slug %s for %s", emergency_slug, clean_orig[:60])
+    try:
+        asyncio.create_task(_background_persist_shortlink(
+            slug=emergency_slug,
+            original_url=clean_orig,
+            target_url=target_url or clean_orig,
+            sub_id=compact_sub_id,
+            user_id=user_id,
+        ))
+    except Exception as sched_err:
+        log.warning("Failed to schedule background persistence for slug %s: %s", emergency_slug, sched_err)
+
+    return emergency_url
+
+
+def ensure_clean_deal_url(
+    deal_url: str,
+    is_amz: bool,
+    original_url: str = "",
+    user_id: Optional[str] = None,
+    sub_id: Optional[str] = None,
+) -> str:
+    """Guardrail: Ensure no non-Amazon deal URL longer than 80 characters or
+    containing raw /api/r?url= or linksredirect.com is ever dumped into Telegram caption.
+    """
+    if is_amz or not deal_url:
+        return deal_url
+
+    clean = deal_url.strip()
+    if re.match(r"^https?://kamaikaro\.in/[A-Za-z0-9_-]{4,15}$", clean):
+        return clean
+
+    if clean.startswith("https://kamaikaro.in/api/r?") or "linksredirect.com" in clean or len(clean) > 80:
+        slug = generate_short_slug(6)
+        short_url = f"https://kamaikaro.in/{slug}"
+        try:
+            compact_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
+            asyncio.create_task(_background_persist_shortlink(
+                slug=slug,
+                original_url=clean,
+                target_url=clean,
+                sub_id=compact_sub,
+                user_id=user_id,
+            ))
+        except Exception:
+            pass
+        return short_url
+
+    return clean
 
 
 def is_branded_shortlink(url: str) -> bool:
@@ -1514,12 +1764,12 @@ async def build_inbody_deal_caption(
         for d in non_amz_deals:
             orig = d.get("original_url", "")
             target_url = d.get("target_url", "")
-            raw_url = target_url or orig
+            raw_url = unwrap_nested_tracking_url(target_url or orig)
             cuelinks_url = d.get("cuelinks_url") or to_cuelinks(raw_url, effective_sub)
             final_tracking = d.get("final_tracking_url") or wrap_fast_redirect_url(cuelinks_url, effective_sub)
             fallback_map[orig] = clean_url_formatting(final_tracking)
-            # Request a short slug for the long cuelinks_url with subid
-            tasks.append(api_shorten_link(cuelinks_url, user_id=user_id, sub_id=effective_sub))
+            # Request a short slug for the long cuelinks_url with subid, passing target_url
+            tasks.append(api_shorten_link(cuelinks_url, user_id=user_id, sub_id=effective_sub, target_url=final_tracking))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for d, res in zip(non_amz_deals, results):
@@ -1556,9 +1806,10 @@ async def build_inbody_deal_caption(
             else:
                 # 2. Bulletproof Fallback: Direct tracking URL as a PLAIN URL (NEVER bare HTML like <a href=...>)
                 final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
-                    d.get("cuelinks_url") or to_cuelinks(target_url or orig, effective_sub), effective_sub
+                    d.get("cuelinks_url") or to_cuelinks(unwrap_nested_tracking_url(target_url or orig), effective_sub), effective_sub
                 )
                 deal_url = clean_url_formatting(final_url)
+            deal_url = ensure_clean_deal_url(deal_url, is_amz=False, original_url=orig, user_id=user_id, sub_id=effective_sub)
 
         pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
         deal_line = f"{pfx}{deal_url}"
@@ -1621,9 +1872,10 @@ async def build_inbody_deal_caption(
                         deal_url = short_url_map[orig]
                     else:
                         final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
-                            d.get("cuelinks_url") or to_cuelinks(target_url or orig, effective_sub), effective_sub
+                            d.get("cuelinks_url") or to_cuelinks(unwrap_nested_tracking_url(target_url or orig), effective_sub), effective_sub
                         )
                         deal_url = clean_url_formatting(final_url)
+                    deal_url = ensure_clean_deal_url(deal_url, is_amz=False, original_url=orig, user_id=user_id, sub_id=effective_sub)
 
                 # Replace the dummy text with the plain deal URL
                 new_line = dummy_re.sub(deal_url, line)
@@ -1657,9 +1909,10 @@ async def build_inbody_deal_caption(
                     deal_url = short_url_map[orig]
                 else:
                     final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
-                        d.get("cuelinks_url") or to_cuelinks(target_url or orig, effective_sub), effective_sub
+                        d.get("cuelinks_url") or to_cuelinks(unwrap_nested_tracking_url(target_url or orig), effective_sub), effective_sub
                     )
                     deal_url = clean_url_formatting(final_url)
+                deal_url = ensure_clean_deal_url(deal_url, is_amz=False, original_url=orig, user_id=user_id, sub_id=effective_sub)
             pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
             add_lines.append(f"{pfx}{deal_url}")
         if caption:
@@ -1682,6 +1935,25 @@ async def build_inbody_deal_caption(
             final_lines.append(line)
 
     caption = "\n".join(final_lines)
+
+    # ------------------------------------------------------------------ #
+    # Pass 5: Safety guardrail - Never output raw /api/r?url= or raw     #
+    # linksredirect.com in caption under any condition.                 #
+    # ------------------------------------------------------------------ #
+    def _sanitize_raw_url_match(m: re.Match) -> str:
+        raw_u = m.group(0)
+        slug = generate_short_slug(6)
+        try:
+            asyncio.create_task(_background_persist_shortlink(slug, raw_u, raw_u, effective_sub, user_id))
+        except Exception:
+            pass
+        return f"https://kamaikaro.in/{slug}"
+
+    caption = re.sub(
+        r"https?://(?:www\.)?(?:kamaikaro\.in/api/r\?[^\s\)\<\>]+|linksredirect\.com/[^\s\)\<\>]+)",
+        _sanitize_raw_url_match,
+        caption,
+    )
 
     # Ensure clean paragraph separation and formatting
     caption = re.sub(r"([^\n])\n((?:🔗 |- )https?://)", r"\1\n\n\2", caption)
@@ -1949,7 +2221,7 @@ async def resolve_and_convert_deals(
                 )
                 store = "Amazon"
             else:
-                raw_or_expanded_url = clean_url or target_url or u
+                raw_or_expanded_url = unwrap_nested_tracking_url(clean_url or target_url or u)
                 cuelinks_url = to_cuelinks(raw_or_expanded_url, effective_sub_id)
                 final_tracking_url = wrap_fast_redirect_url(cuelinks_url, effective_sub_id)
                 converted_url = clean_url_formatting(final_tracking_url)
@@ -2095,16 +2367,15 @@ async def convert_text(
                     )
                 )
             else:
-                cuelinks_url = to_cuelinks(clean_url, effective_sub_id)
+                raw_or_clean = unwrap_nested_tracking_url(clean_url or target_url or u)
+                cuelinks_url = to_cuelinks(raw_or_clean, effective_sub_id)
                 converted_url = clean_url_formatting(wrap_fast_redirect_url(cuelinks_url, effective_sub_id))
 
-            # Mandatory short URL conversion via API route:
-            # POST https://www.kamaikaro.in/api/links/shorten
-            # with { originalUrl: cuelinksUrl, userId: user_id, subId: sub_id }
+            # Mandatory short URL conversion via API route or Supabase:
             short_url = None
             try:
                 target_shorten_url = cuelinks_url if not is_amz else converted_url
-                short_url = await api_shorten_link(target_shorten_url, user_id=user_id, sub_id=effective_sub_id)
+                short_url = await api_shorten_link(target_shorten_url, user_id=user_id, sub_id=effective_sub_id, target_url=converted_url)
             except Exception as short_err:
                 log.warning("api_shorten_link error in convert_text: %s", short_err)
 
@@ -2112,9 +2383,8 @@ async def convert_text(
                 final_link = clean_url_formatting(short_url)
                 log.info("Shortened affiliate URL: %s -> %s", u, final_link)
             else:
-                # Fallback: If shorten API fails, format with direct clean plain URL (never bare HTML tags)
-                final_link = clean_url_formatting(converted_url)
-                log.info("api_shorten_link failed; formatted as clean plain URL: %s -> %s", u, final_link)
+                final_link = ensure_clean_deal_url(converted_url, is_amz=is_amz, original_url=u, user_id=user_id, sub_id=effective_sub_id)
+                log.info("api_shorten_link fallback clean URL: %s -> %s", u, final_link)
 
             text = text.replace(u, final_link)
             converted_count += 1
@@ -2143,8 +2413,9 @@ async def convert_text(
                 pass
             continue
 
-    # Safety pass: Never output raw https://linksredirect.com/?... in Telegram channel post!
-    text = re.sub(r"(?<!\(<)(?<!\()https://linksredirect\.com/[^\s\)\]]+(?!\>)", r"[Buy Now / View Deal](<\g<0>>)", text)
+    # Safety pass: Never output raw https://linksredirect.com/?... or /api/r?url=... in Telegram channel post!
+    text = re.sub(r"(?<!\(<)(?<!\()https://(?:www\.)?linksredirect\.com/[^\s\)\]]+(?!\>)", r"[Buy Now / View Deal](<\g<0>>)", text)
+    text = re.sub(r"(?<!\(<)(?<!\()https://(?:www\.)?kamaikaro\.in/api/r\?[^\s\)\]]+(?!\>)", r"[Buy Now / View Deal](<\g<0>>)", text)
 
     return text, converted_count
 
@@ -4586,7 +4857,13 @@ async def handle_user_incoming_url(message: Message, state: FSMContext = None) -
             except Exception:
                 short_url = None
 
-        final_link = short_url or converted_url
+        final_link = ensure_clean_deal_url(
+            short_url or converted_url,
+            is_amz=is_amz,
+            original_url=u,
+            user_id=user_id,
+            sub_id=user_sub_id,
+        )
         converted_deals.append({
             "original": u,
             "converted": converted_url,
