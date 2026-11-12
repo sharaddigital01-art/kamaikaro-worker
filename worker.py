@@ -1191,7 +1191,6 @@ async def api_shorten_link(
     endpoints = [
         "https://www.kamaikaro.in/api/links/shorten",
         f"{BASE_WEB_URL}/api/links/shorten",
-        "https://kamaikaro.in/api/links/shorten",
     ]
 
     payload: dict[str, Any] = {"originalUrl": clean_orig}
@@ -1202,7 +1201,7 @@ async def api_shorten_link(
 
     async def _request_shorten() -> Optional[str]:
         s = await http()
-        timeout = aiohttp.ClientTimeout(total=5.0, connect=2.0, sock_read=4.5)
+        timeout = aiohttp.ClientTimeout(total=7.0, connect=2.5, sock_read=6.0)
 
         for endpoint in endpoints:
             try:
@@ -1258,7 +1257,7 @@ async def api_shorten_link(
         return None
 
     try:
-        res = await asyncio.wait_for(_request_shorten(), timeout=5.5)
+        res = await asyncio.wait_for(_request_shorten(), timeout=7.5)
         if res:
             _SHORTEN_CACHE[cache_key] = res
         return res
@@ -1420,17 +1419,17 @@ async def build_inbody_deal_caption(
     """Format deal post with native store-branded plain-text shortlinks (Zero Warning Popup, Zero Buttons):
     - Amazon: 🔗 https://amzn.to/{ASIN}?tag=kamaikaro02-21&ascsubtag={subid} (100% UNTOUCHED)
     - Non-Amazon: Compact Kamaikaro shortlink (e.g. https://kamaikaro.in/{slug})
-    - Non-Amazon Fallback: Clean HTML hyperlink (<a href="{final_tracking_url}">Click to Buy</a>)
-    - Preserves category / product labels (e.g. 'Tshirts : https://...' or 'Tshirts : <a href=...>')
-    - Strips external channel promotions and spam
-    - Strictly prevents raw linksredirect.com or nested %252F URLs from showing as plain text
+    - Non-Amazon Fallback: Direct tracking URL as a PLAIN URL (NEVER bare HTML like <a href=...>)
+    - Preserves category / product labels (e.g. 'Men : https://...')
+    - Strips leftover dummy text like '[Deal Link]' and 'Click to Buy'
+    - Ensures every category line retains its own corresponding monetized link
     """
     if not text:
         text = ""
 
     # ------------------------------------------------------------------ #
     # Pre-process: extract href URLs from HTML anchors and markdown links #
-    # Preserving inner category/product text when present (e.g. Tshirts). #
+    # Preserving inner category/product text when present (e.g. Men).    #
     # ------------------------------------------------------------------ #
     def _clean_anchor_match(m: re.Match) -> str:
         url = m.group(1).strip()
@@ -1475,6 +1474,16 @@ async def build_inbody_deal_caption(
     # Strip any remaining stray formatting tags (bold, italic, etc.)
     text = re.sub(r'</?(?:b|i|u|s|em|strong|br|p|span|div)[^>]*>', '', text, flags=re.IGNORECASE)
 
+    # Strip leftover dummy text immediately before URLs (e.g. 'Men : Click to Buy : https://...')
+    text = re.sub(
+        r'(?:\[(?:deal link|click to buy|buy now|link)\]|click to buy|deal link|buy now)\s*[:\-–—]?\s*(https?://)',
+        r'\1',
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Clean duplicate colons or duplicated category names (e.g. 'Men : Men : https://...')
+    text = re.sub(r'\b([A-Za-z0-9_\s]{2,20})\s*:\s*\1\s*:', r'\1 :', text)
+
     promo_patterns = [
         re.compile(r"^(?:join|follow|subscribe|more deals|more loots|updates on|channel)\b.*@\w+", re.I),
         re.compile(r"^join\s+(?:our\s+)?(?:telegram|channel|group)\b.*$", re.I),
@@ -1508,7 +1517,7 @@ async def build_inbody_deal_caption(
             raw_url = target_url or orig
             cuelinks_url = d.get("cuelinks_url") or to_cuelinks(raw_url, effective_sub)
             final_tracking = d.get("final_tracking_url") or wrap_fast_redirect_url(cuelinks_url, effective_sub)
-            fallback_map[orig] = final_tracking
+            fallback_map[orig] = clean_url_formatting(final_tracking)
             # Request a short slug for the long cuelinks_url with subid
             tasks.append(api_shorten_link(cuelinks_url, user_id=user_id, sub_id=effective_sub))
 
@@ -1519,10 +1528,13 @@ async def build_inbody_deal_caption(
                 short_url_map[orig] = res.strip()
                 log.info("Shortened non-Amazon deal %s -> %s", orig[:40], res.strip())
             else:
-                log.info("api_shorten_link returned %s for %s; using HTML hyperlink fallback", res, orig[:40])
+                log.info("api_shorten_link returned %s for %s; using PLAIN URL fallback", res, orig[:40])
 
     replaced_deals = set()
 
+    # ------------------------------------------------------------------ #
+    # Pass 1: Replace direct URL occurrences in each line                #
+    # ------------------------------------------------------------------ #
     for d in converted_deals:
         orig = d.get("original_url", "")
         conv = d.get("converted_url", "")
@@ -1539,14 +1551,14 @@ async def build_inbody_deal_caption(
         else:
             # Non-Amazon affiliate conversion:
             # 1. Prefer compact shortened URL: https://kamaikaro.in/{slug}
-            if orig in short_url_map:
+            if orig in short_url_map and short_url_map[orig]:
                 deal_url = short_url_map[orig]
             else:
-                # 2. Fallback: clean HTML hyperlink hiding long tracking parameters
-                final_url = fallback_map.get(orig) or wrap_fast_redirect_url(
-                    to_cuelinks(target_url or orig, effective_sub), effective_sub
+                # 2. Bulletproof Fallback: Direct tracking URL as a PLAIN URL (NEVER bare HTML like <a href=...>)
+                final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
+                    d.get("cuelinks_url") or to_cuelinks(target_url or orig, effective_sub), effective_sub
                 )
-                deal_url = f'<a href="{final_url}">Click to Buy</a>'
+                deal_url = clean_url_formatting(final_url)
 
         pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
         deal_line = f"{pfx}{deal_url}"
@@ -1578,11 +1590,58 @@ async def build_inbody_deal_caption(
         if deal_matched:
             caption = "\n".join(new_lines)
 
-    # Any deals not found in body text: append directly beneath product/price info
+    # ------------------------------------------------------------------ #
+    # Pass 2: Replace dummy placeholder text (e.g. 'Click to Buy' /       #
+    # '[Deal Link]') on lines without a URL with corresponding unplaced  #
+    # deal URLs so users always have a clickable link on every line.     #
+    # ------------------------------------------------------------------ #
     unplaced = [d for d in converted_deals if d.get("original_url") not in replaced_deals]
+    dummy_re = re.compile(r'(?:\[(?:deal link|click to buy|buy now|link)\]|click to buy|\[deal link\])', re.IGNORECASE)
+
     if unplaced:
+        lines_in_cap = caption.splitlines()
+        new_lines = []
+        unplaced_idx = 0
+        for line in lines_in_cap:
+            if unplaced_idx < len(unplaced) and dummy_re.search(line) and not re.search(r'https?://', line):
+                d = unplaced[unplaced_idx]
+                orig = d.get("original_url", "")
+                conv = d.get("converted_url", "")
+                target_url = d.get("target_url", "")
+                store = d.get("store", "Store")
+                is_amz = bool(d.get("is_amz"))
+
+                if is_amz:
+                    deal_url = get_native_deal_link(
+                        store=store, is_amz=is_amz, original_url=orig, converted_url=conv,
+                        target_url=target_url, user_sub_id=effective_sub, custom_amazon_tag=custom_amazon_tag,
+                    )
+                else:
+                    if orig in short_url_map and short_url_map[orig]:
+                        deal_url = short_url_map[orig]
+                    else:
+                        final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
+                            d.get("cuelinks_url") or to_cuelinks(target_url or orig, effective_sub), effective_sub
+                        )
+                        deal_url = clean_url_formatting(final_url)
+
+                # Replace the dummy text with the plain deal URL
+                new_line = dummy_re.sub(deal_url, line)
+                new_line = re.sub(r':\s*:', ':', new_line)
+                new_lines.append(new_line)
+                replaced_deals.add(orig)
+                unplaced_idx += 1
+            else:
+                new_lines.append(line)
+        caption = "\n".join(new_lines)
+
+    # ------------------------------------------------------------------ #
+    # Pass 3: Append any remaining unplaced deals at the bottom          #
+    # ------------------------------------------------------------------ #
+    remaining_unplaced = [d for d in converted_deals if d.get("original_url") not in replaced_deals]
+    if remaining_unplaced:
         add_lines = []
-        for d in unplaced:
+        for d in remaining_unplaced:
             store = d.get("store", "Store")
             is_amz = bool(d.get("is_amz"))
             conv = d.get("converted_url", "")
@@ -1594,13 +1653,13 @@ async def build_inbody_deal_caption(
                     target_url=target_url, user_sub_id=effective_sub, custom_amazon_tag=custom_amazon_tag,
                 )
             else:
-                if orig in short_url_map:
+                if orig in short_url_map and short_url_map[orig]:
                     deal_url = short_url_map[orig]
                 else:
-                    final_url = fallback_map.get(orig) or wrap_fast_redirect_url(
-                        to_cuelinks(target_url or orig, effective_sub), effective_sub
+                    final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
+                        d.get("cuelinks_url") or to_cuelinks(target_url or orig, effective_sub), effective_sub
                     )
-                    deal_url = f'<a href="{final_url}">Click to Buy</a>'
+                    deal_url = clean_url_formatting(final_url)
             pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
             add_lines.append(f"{pfx}{deal_url}")
         if caption:
@@ -1608,26 +1667,24 @@ async def build_inbody_deal_caption(
         else:
             caption = "\n".join(add_lines)
 
-    # Safety pass: strip any bare linksredirect.com URLs that slipped through
-    # (these are raw Cuelinks redirect URLs — never expose to users as plain text)
-    caption = re.sub(
-        r'(?<!url=)(?<!url%3D)(?<!href=")(?<!href=\')https://linksredirect\.com/[^\s<>"\')\]]+',
-        "",
-        caption,
-    )
-    # Also safety check: never expose raw kamaikaro.in/api/r?url= as bare plain text
-    # (only allowed inside href="...")
-    caption = re.sub(
-        r'(?<!href=")(?<!href=\')https://(?:www\.)?kamaikaro\.in/api/r\?url=[^\s<>"\')\]]+',
-        "",
-        caption,
-    )
-    # Also remove any orphaned "[Deal Link]" placeholder text with no URL following it
-    caption = re.sub(r'\[Deal Link\]\s*(?!\(https?://)', '', caption)
+    # ------------------------------------------------------------------ #
+    # Pass 4: Clean up any orphan dummy text like 'Click to Buy' that    #
+    # was left without a URL on that line. Under NO circumstance should  #
+    # 'Click to Buy' appear without a clickable URL next to it.          #
+    # ------------------------------------------------------------------ #
+    final_lines = []
+    for line in caption.splitlines():
+        if dummy_re.search(line) and not re.search(r'https?://', line):
+            cleaned_line = dummy_re.sub('', line).rstrip(" :-–—")
+            if cleaned_line.strip():
+                final_lines.append(cleaned_line)
+        else:
+            final_lines.append(line)
 
-    # Ensure deal line has clean paragraph separation below title/price lines
+    caption = "\n".join(final_lines)
+
+    # Ensure clean paragraph separation and formatting
     caption = re.sub(r"([^\n])\n((?:🔗 |- )https?://)", r"\1\n\n\2", caption)
-    caption = re.sub(r"([^\n])\n((?:🔗 |- )<a href=)", r"\1\n\n\2", caption)
     caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
     return caption
 
@@ -2055,10 +2112,9 @@ async def convert_text(
                 final_link = clean_url_formatting(short_url)
                 log.info("Shortened affiliate URL: %s -> %s", u, final_link)
             else:
-                # Fallback: If shorten API fails, format the text cleanly with HTML hyperlink:
-                # <a href="{converted_url}">Click to Buy</a> so long parameters remain hidden behind clean text.
-                final_link = f'<a href="{converted_url}">Click to Buy</a>'
-                log.info("api_shorten_link failed; formatted as clean hyperlink: %s -> %s", u, final_link)
+                # Fallback: If shorten API fails, format with direct clean plain URL (never bare HTML tags)
+                final_link = clean_url_formatting(converted_url)
+                log.info("api_shorten_link failed; formatted as clean plain URL: %s -> %s", u, final_link)
 
             text = text.replace(u, final_link)
             converted_count += 1
