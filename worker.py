@@ -67,8 +67,39 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 SESSION_STRING = os.getenv("TELETHON_SESSION_STRING", "").strip()
 BASE_WEB_URL = os.getenv("BASE_WEB_URL", "https://kamai-three.vercel.app").rstrip("/")
 WORKER_API_SECRET = os.getenv("WORKER_API_SECRET", "kamaikaro-tg-worker-secret-2026").strip()
-CUELINKS_PUB_ID = os.getenv("CUELINKS_PUB_ID", "282274").strip()
-CUELINKS_CHNL_ID = os.getenv("CUELINKS_CHNL_ID", "332862").strip()
+CUELINKS_CID = (
+    os.getenv("CUELINKS_CID", "")
+    or os.getenv("CUELINKS_PUB_ID", "")
+    or "282274"
+).strip()
+CUELINKS_PUB_ID = CUELINKS_CID  # backwards-compatible alias
+
+CUELINKS_CHNL_ID = (
+    os.getenv("CUELINKS_CHNL_ID", "")
+    or os.getenv("CUELINKS_CHANNEL_ID", "")
+    or "332862"
+).strip()
+CUELINKS_CHANNEL_ID = CUELINKS_CHNL_ID  # backwards-compatible alias
+
+
+def get_cuelinks_cid() -> str:
+    """Get active Cuelinks Publisher CID from environment or dynamic config."""
+    return (
+        os.getenv("CUELINKS_CID", "")
+        or os.getenv("CUELINKS_PUB_ID", "")
+        or CUELINKS_CID
+        or "282274"
+    ).strip()
+
+
+def get_cuelinks_chnl_id() -> str:
+    """Get active Cuelinks Channel ID from environment or dynamic config."""
+    return (
+        os.getenv("CUELINKS_CHNL_ID", "")
+        or os.getenv("CUELINKS_CHANNEL_ID", "")
+        or CUELINKS_CHNL_ID
+        or "332862"
+    ).strip()
 SYNC_INTERVAL = int(os.getenv("CONFIG_SYNC_INTERVAL", "60"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 PORT = int(os.getenv("PORT", "8080"))
@@ -1039,6 +1070,18 @@ async def unshorten_url(url: str) -> str:
     return resolved
 
 
+async def unshorten_if_needed(url: str, timeout: float = 4.0) -> str:
+    """If url is a shortlink (e.g. myntr.in, fkrt.co), resolve to final destination URL."""
+    if not url or not is_shortened_url(url):
+        return url
+    try:
+        res = await asyncio.wait_for(unshorten_url(url), timeout=timeout)
+        return unwrap_nested_tracking_url(res) if res else url
+    except Exception as err:
+        log.warning("unshorten_if_needed failed for %s: %s", url[:50], err)
+        return url
+
+
 def clean_url_formatting(url: str) -> str:
     """Ensure URL is completely contiguous without spaces, newlines, or splits."""
     if not url:
@@ -1120,16 +1163,22 @@ def generate_short_slug(length: int = 6) -> str:
     return "".join(secrets.choice(chars) for _ in range(length))
 
 
-def to_cuelinks(url: str, sub_id: str) -> str:
+def to_cuelinks(url: str, sub_id: str = "", user_id: Optional[str] = None) -> str:
     clean = clean_url_formatting(url)
     if not clean:
         return ""
-    # Unwrap any nested redirectors and outer tracking parameters
+    # Step A: Extract and unwrap the clean destination product URL
     clean = unwrap_nested_tracking_url(clean)
     clean = strip_affiliate_params(clean) or clean
+
+    # Step B: Wrap the clean merchant URL inside OUR Cuelinks affiliate redirector
+    cid = get_cuelinks_cid()
+    chnl_id = get_cuelinks_chnl_id()
+    compact_sub_id = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
     encoded_target_url = urllib.parse.quote_plus(clean)
-    compact_sub_id = resolve_compact_sub_id(sub_id=sub_id)
-    raw_cuelink = f"https://linksredirect.com/?cid={CUELINKS_PUB_ID}&chnl_id={CUELINKS_CHNL_ID}&subid={compact_sub_id}&url={encoded_target_url}"
+
+    raw_cuelink = f"https://linksredirect.com/?cid={cid}&chnl_id={chnl_id}&subid={compact_sub_id}&url={encoded_target_url}"
+    log.info("[CUELINKS_MONETIZED] subid=%s -> cid=%s -> target=%s", compact_sub_id, cid, clean[:50])
     return clean_url_formatting(raw_cuelink)
 
 
@@ -1225,11 +1274,21 @@ async def direct_supabase_create_shortlink(
 
     clean_orig = clean_url_formatting(original_url)
     clean_target = clean_url_formatting(target_url or original_url)
-    if not clean_orig:
+    if not clean_orig and not clean_target:
         return None
 
-    slug = generate_short_slug(6)
     compact_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id) if (sub_id or user_id) else ""
+
+    # Step C: For non-Amazon deals, ensure destination is 100% Cuelinks affiliate link
+    is_amz = is_amazon_url(clean_target) or is_amazon_url(clean_orig)
+    if not is_amz:
+        clean_dest = unwrap_nested_tracking_url(clean_target or clean_orig)
+        if "linksredirect.com" not in clean_dest:
+            clean_dest = to_cuelinks(clean_dest, sub_id=compact_sub, user_id=user_id)
+        clean_target = clean_dest
+        clean_orig = clean_dest
+
+    slug = generate_short_slug(6)
 
     # Validate UUID format so Postgres doesn't reject numeric/telegram IDs
     valid_uuid = None
@@ -1264,7 +1323,7 @@ async def direct_supabase_create_shortlink(
         try:
             async with s.post(url, headers=headers, json=payload, timeout=timeout) as resp:
                 if resp.status in (200, 201):
-                    log.info("direct_supabase_create_shortlink inserted slug %s into %s", slug, tbl)
+                    log.info("direct_supabase_create_shortlink inserted slug %s into %s (target: %s)", slug, tbl, clean_target[:60])
                     return f"https://kamaikaro.in/{slug}"
                 elif resp.status == 409:
                     slug = generate_short_slug(7)
@@ -1286,6 +1345,22 @@ async def _background_persist_shortlink(
     user_id: Optional[str] = None,
 ) -> bool:
     """Background worker task to guarantee shortlink persistence to DB/API even if initial synchronous attempt failed."""
+    clean_orig = clean_url_formatting(original_url)
+    clean_target = clean_url_formatting(target_url or original_url)
+    if not clean_orig and not clean_target:
+        return False
+
+    compact_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id) if (sub_id or user_id) else ""
+
+    # Step C: For non-Amazon deals, ensure destination is 100% Cuelinks affiliate link
+    is_amz = is_amazon_url(clean_target) or is_amazon_url(clean_orig)
+    if not is_amz:
+        clean_dest = unwrap_nested_tracking_url(clean_target or clean_orig)
+        if "linksredirect.com" not in clean_dest:
+            clean_dest = to_cuelinks(clean_dest, sub_id=compact_sub, user_id=user_id)
+        clean_target = clean_dest
+        clean_orig = clean_dest
+
     # 1. Supabase direct
     if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         valid_uuid = None
@@ -1296,9 +1371,9 @@ async def _background_persist_shortlink(
 
         payload: dict[str, Any] = {
             "slug": slug,
-            "original_url": original_url,
-            "target_url": target_url or original_url,
-            "subId": sub_id or None,
+            "original_url": clean_orig,
+            "target_url": clean_target,
+            "subId": compact_sub or None,
             "click_count": 0,
         }
         if valid_uuid:
@@ -1317,7 +1392,7 @@ async def _background_persist_shortlink(
                 try:
                     async with s.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=4.0)) as r:
                         if r.status in (200, 201):
-                            log.info("Background persisted slug %s to Supabase %s", slug, tbl)
+                            log.info("Background persisted slug %s to Supabase %s (target: %s)", slug, tbl, clean_target[:60])
                             return True
                 except Exception as ex:
                     log.warning("Background persist error (%s) attempt %d: %s", tbl, attempt + 1, ex)
@@ -1330,12 +1405,12 @@ async def _background_persist_shortlink(
     ]
     api_payload: dict[str, Any] = {
         "slug": slug,
-        "originalUrl": original_url,
+        "originalUrl": clean_target,
     }
     if user_id:
         api_payload["userId"] = str(user_id)
-    if sub_id:
-        api_payload["subId"] = sub_id
+    if compact_sub:
+        api_payload["subId"] = compact_sub
 
     s = await http()
     for ep in endpoints:
@@ -1364,11 +1439,22 @@ async def api_shorten_link(
     Guarantees 100% short URL return and NEVER dumps long raw tracking URLs.
     """
     clean_orig = clean_url_formatting(original_url)
-    if not clean_orig:
+    clean_target = clean_url_formatting(target_url or original_url)
+    if not clean_orig and not clean_target:
         return None
 
     compact_sub_id = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
-    cache_key = f"{clean_orig}_{compact_sub_id}"
+
+    # Step C: For non-Amazon deals, ensure destination is 100% Cuelinks affiliate link
+    is_amz = is_amazon_url(clean_target) or is_amazon_url(clean_orig)
+    if not is_amz:
+        clean_dest = unwrap_nested_tracking_url(clean_target or clean_orig)
+        if "linksredirect.com" not in clean_dest:
+            clean_dest = to_cuelinks(clean_dest, sub_id=compact_sub_id, user_id=user_id)
+        clean_target = clean_dest
+        clean_orig = clean_dest
+
+    cache_key = f"{clean_target}_{compact_sub_id}"
     if cache_key in _SHORTEN_CACHE:
         return _SHORTEN_CACHE[cache_key]
 
@@ -1377,7 +1463,7 @@ async def api_shorten_link(
         try:
             db_res = await direct_supabase_create_shortlink(
                 original_url=clean_orig,
-                target_url=target_url or clean_orig,
+                target_url=clean_target,
                 sub_id=compact_sub_id,
                 user_id=user_id,
             )
@@ -1393,7 +1479,7 @@ async def api_shorten_link(
         f"{BASE_WEB_URL}/api/links/shorten",
     ]
 
-    payload: dict[str, Any] = {"originalUrl": clean_orig}
+    payload: dict[str, Any] = {"originalUrl": clean_target}
     if user_id:
         payload["userId"] = str(user_id)
     if compact_sub_id:
@@ -1462,18 +1548,18 @@ async def api_shorten_link(
             _SHORTEN_CACHE[cache_key] = res
             return res
     except Exception as e:
-        log.warning("api_shorten_link request failed for %s (%s)", clean_orig[:60], e)
+        log.warning("api_shorten_link request failed for %s (%s)", clean_target[:60], e)
 
     # Guaranteed Emergency Fallback: generate slug and persist in background
     emergency_slug = generate_short_slug(6)
     emergency_url = f"https://kamaikaro.in/{emergency_slug}"
     _SHORTEN_CACHE[cache_key] = emergency_url
-    log.info("api_shorten_link generated emergency slug %s for %s", emergency_slug, clean_orig[:60])
+    log.info("api_shorten_link generated emergency slug %s for %s", emergency_slug, clean_target[:60])
     try:
         asyncio.create_task(_background_persist_shortlink(
             slug=emergency_slug,
             original_url=clean_orig,
-            target_url=target_url or clean_orig,
+            target_url=clean_target,
             sub_id=compact_sub_id,
             user_id=user_id,
         ))
@@ -1505,10 +1591,16 @@ def ensure_clean_deal_url(
         short_url = f"https://kamaikaro.in/{slug}"
         try:
             compact_sub = resolve_compact_sub_id(sub_id=sub_id, user_id=user_id)
+            # Step C: Ensure destination is 100% Cuelinks affiliate link
+            unwrapped = unwrap_nested_tracking_url(clean)
+            if "linksredirect.com" in unwrapped:
+                cuelink_dest = unwrapped
+            else:
+                cuelink_dest = to_cuelinks(unwrapped, sub_id=compact_sub, user_id=user_id)
             asyncio.create_task(_background_persist_shortlink(
                 slug=slug,
-                original_url=clean,
-                target_url=clean,
+                original_url=cuelink_dest,
+                target_url=cuelink_dest,
                 sub_id=compact_sub,
                 user_id=user_id,
             ))
@@ -1765,11 +1857,15 @@ async def build_inbody_deal_caption(
             orig = d.get("original_url", "")
             target_url = d.get("target_url", "")
             raw_url = unwrap_nested_tracking_url(target_url or orig)
-            cuelinks_url = d.get("cuelinks_url") or to_cuelinks(raw_url, effective_sub)
-            final_tracking = d.get("final_tracking_url") or wrap_fast_redirect_url(cuelinks_url, effective_sub)
-            fallback_map[orig] = clean_url_formatting(final_tracking)
-            # Request a short slug for the long cuelinks_url with subid, passing target_url
-            tasks.append(api_shorten_link(cuelinks_url, user_id=user_id, sub_id=effective_sub, target_url=final_tracking))
+            if is_shortened_url(raw_url):
+                try:
+                    raw_url = await unshorten_if_needed(raw_url)
+                except Exception:
+                    pass
+            cuelinks_url = d.get("cuelinks_url") or to_cuelinks(raw_url, effective_sub, user_id=user_id)
+            fallback_map[orig] = clean_url_formatting(cuelinks_url)
+            # Step C: Save THIS exact cuelinks_url as target_url in Supabase
+            tasks.append(api_shorten_link(cuelinks_url, user_id=user_id, sub_id=effective_sub, target_url=cuelinks_url))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for d, res in zip(non_amz_deals, results):
@@ -1804,11 +1900,9 @@ async def build_inbody_deal_caption(
             if orig in short_url_map and short_url_map[orig]:
                 deal_url = short_url_map[orig]
             else:
-                # 2. Bulletproof Fallback: Direct tracking URL as a PLAIN URL (NEVER bare HTML like <a href=...>)
-                final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
-                    d.get("cuelinks_url") or to_cuelinks(unwrap_nested_tracking_url(target_url or orig), effective_sub), effective_sub
+                deal_url = d.get("cuelinks_url") or fallback_map.get(orig) or to_cuelinks(
+                    unwrap_nested_tracking_url(target_url or orig), effective_sub, user_id=user_id
                 )
-                deal_url = clean_url_formatting(final_url)
             deal_url = ensure_clean_deal_url(deal_url, is_amz=False, original_url=orig, user_id=user_id, sub_id=effective_sub)
 
         pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
@@ -1871,10 +1965,9 @@ async def build_inbody_deal_caption(
                     if orig in short_url_map and short_url_map[orig]:
                         deal_url = short_url_map[orig]
                     else:
-                        final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
-                            d.get("cuelinks_url") or to_cuelinks(unwrap_nested_tracking_url(target_url or orig), effective_sub), effective_sub
+                        deal_url = d.get("cuelinks_url") or fallback_map.get(orig) or to_cuelinks(
+                            unwrap_nested_tracking_url(target_url or orig), effective_sub, user_id=user_id
                         )
-                        deal_url = clean_url_formatting(final_url)
                     deal_url = ensure_clean_deal_url(deal_url, is_amz=False, original_url=orig, user_id=user_id, sub_id=effective_sub)
 
                 # Replace the dummy text with the plain deal URL
@@ -1908,10 +2001,9 @@ async def build_inbody_deal_caption(
                 if orig in short_url_map and short_url_map[orig]:
                     deal_url = short_url_map[orig]
                 else:
-                    final_url = fallback_map.get(orig) or d.get("final_tracking_url") or wrap_fast_redirect_url(
-                        d.get("cuelinks_url") or to_cuelinks(unwrap_nested_tracking_url(target_url or orig), effective_sub), effective_sub
+                    deal_url = d.get("cuelinks_url") or fallback_map.get(orig) or to_cuelinks(
+                        unwrap_nested_tracking_url(target_url or orig), effective_sub, user_id=user_id
                     )
-                    deal_url = clean_url_formatting(final_url)
                 deal_url = ensure_clean_deal_url(deal_url, is_amz=False, original_url=orig, user_id=user_id, sub_id=effective_sub)
             pfx = get_deal_link_prefix(store=store, is_amz=is_amz)
             add_lines.append(f"{pfx}{deal_url}")
@@ -1944,7 +2036,18 @@ async def build_inbody_deal_caption(
         raw_u = m.group(0)
         slug = generate_short_slug(6)
         try:
-            asyncio.create_task(_background_persist_shortlink(slug, raw_u, raw_u, effective_sub, user_id))
+            unwrapped = unwrap_nested_tracking_url(raw_u)
+            if "linksredirect.com" in unwrapped:
+                cuelink_dest = unwrapped
+            else:
+                cuelink_dest = to_cuelinks(unwrapped, sub_id=effective_sub, user_id=user_id)
+            asyncio.create_task(_background_persist_shortlink(
+                slug=slug,
+                original_url=cuelink_dest,
+                target_url=cuelink_dest,
+                sub_id=effective_sub,
+                user_id=user_id,
+            ))
         except Exception:
             pass
         return f"https://kamaikaro.in/{slug}"
@@ -2222,9 +2325,13 @@ async def resolve_and_convert_deals(
                 store = "Amazon"
             else:
                 raw_or_expanded_url = unwrap_nested_tracking_url(clean_url or target_url or u)
-                cuelinks_url = to_cuelinks(raw_or_expanded_url, effective_sub_id)
-                final_tracking_url = wrap_fast_redirect_url(cuelinks_url, effective_sub_id)
-                converted_url = clean_url_formatting(final_tracking_url)
+                if is_shortened_url(raw_or_expanded_url):
+                    try:
+                        raw_or_expanded_url = await unshorten_if_needed(raw_or_expanded_url)
+                    except Exception:
+                        pass
+                cuelinks_url = to_cuelinks(raw_or_expanded_url, effective_sub_id, user_id=user_id)
+                converted_url = clean_url_formatting(cuelinks_url)
                 clean_lower = f"{clean_url} {target_url} {u}".lower()
                 if "shopsy" in clean_lower:
                     store = "Shopsy"
@@ -2244,7 +2351,7 @@ async def resolve_and_convert_deals(
                 "target_url": target_url,
                 "converted_url": converted_url,
                 "cuelinks_url": cuelinks_url if not is_amz else "",
-                "final_tracking_url": final_tracking_url if not is_amz else "",
+                "final_tracking_url": cuelinks_url if not is_amz else "",
                 "is_amz": is_amz,
                 "store": store,
                 "btn_label": btn_label,
@@ -2368,14 +2475,19 @@ async def convert_text(
                 )
             else:
                 raw_or_clean = unwrap_nested_tracking_url(clean_url or target_url or u)
-                cuelinks_url = to_cuelinks(raw_or_clean, effective_sub_id)
-                converted_url = clean_url_formatting(wrap_fast_redirect_url(cuelinks_url, effective_sub_id))
+                if is_shortened_url(raw_or_clean):
+                    try:
+                        raw_or_clean = await unshorten_if_needed(raw_or_clean)
+                    except Exception:
+                        pass
+                cuelinks_url = to_cuelinks(raw_or_clean, effective_sub_id, user_id=user_id)
+                converted_url = clean_url_formatting(cuelinks_url)
 
             # Mandatory short URL conversion via API route or Supabase:
             short_url = None
             try:
                 target_shorten_url = cuelinks_url if not is_amz else converted_url
-                short_url = await api_shorten_link(target_shorten_url, user_id=user_id, sub_id=effective_sub_id, target_url=converted_url)
+                short_url = await api_shorten_link(target_shorten_url, user_id=user_id, sub_id=effective_sub_id, target_url=target_shorten_url)
             except Exception as short_err:
                 log.warning("api_shorten_link error in convert_text: %s", short_err)
 
@@ -4815,7 +4927,7 @@ async def handle_user_incoming_url(message: Message, state: FSMContext = None) -
         target_url = u
         if is_shortened_url(u):
             try:
-                target_url = await asyncio.wait_for(unshorten_url(u), timeout=4.0)
+                target_url = await unshorten_if_needed(u)
             except Exception:
                 target_url = u
 
@@ -4834,7 +4946,13 @@ async def handle_user_incoming_url(message: Message, state: FSMContext = None) -
             )
             store = "Amazon"
         else:
-            converted_url = clean_url_formatting(to_cuelinks(clean_url, user_sub_id))
+            raw_merchant = unwrap_nested_tracking_url(clean_url or target_url or u)
+            if is_shortened_url(raw_merchant):
+                try:
+                    raw_merchant = await unshorten_if_needed(raw_merchant)
+                except Exception:
+                    pass
+            converted_url = clean_url_formatting(to_cuelinks(raw_merchant, user_sub_id, user_id=user_id))
             clean_lower = f"{clean_url} {target_url} {u}".lower()
             if "shopsy" in clean_lower:
                 store = "Shopsy"
